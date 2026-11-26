@@ -1,0 +1,64 @@
+name: TinyTalk for Sharp Brain
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-tinytalk.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fetch TinyTalk source
+        uses: actions/checkout@v4
+        with:
+          repository: therezor/cardputer-ai
+          ref: main
+          path: source
+          persist-credentials: false
+          lfs: true
+      - name: Install ARMv5 cross-compiler and emulator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-arm-linux-gnueabi qemu-user
+      - name: Cross-compile for ARM9 soft-float Linux
+        working-directory: source
+        run: |
+          mkdir -p ../dist
+          arm-linux-gnueabi-g++ -std=c++17 -O2 -march=armv5te -marm -mfloat-abi=soft -static -pthread -DLLM_FORCE_SCALAR -I tools/host tools/host/host_test.cpp main/llm.cpp -o ../dist/tinytalk
+          arm-linux-gnueabi-strip ../dist/tinytalk
+          cp embed/model_neo_q4.bin embed/tok_neo.bin ../dist/
+          for f in LICENSE LICENSE.md NOTICE NOTICE.md; do if [ -f "$f" ]; then cp "$f" ../dist/; fi; done
+          git rev-parse HEAD > ../dist/source-commit.txt
+          file ../dist/tinytalk
+          arm-linux-gnueabi-readelf -A ../dist/tinytalk
+      - name: Test inference on emulated ARM926
+        working-directory: dist
+        run: |
+          timeout 120 qemu-arm -cpu arm926 ./tinytalk model_neo_q4.bin tok_neo.bin 'User: Hello!\nBot:' --max 8 --temp 0 --kv 72 > smoke-test.txt
+          cat smoke-test.txt
+          test -s smoke-test.txt
+      - name: Create simple interactive launcher
+        working-directory: dist
+        run: |
+          cat > chat.sh <<'SH'
+          #!/bin/sh
+          cd "$(dirname "$0")" || exit 1
+          chmod +x ./tinytalk
+          printf 'BRAINBOT / Sharp Brain\nType /quit to exit.\n'
+          while printf '\nYou: ' && IFS= read -r message; do
+            [ "$message" = /quit ] && break
+            [ -z "$message" ] && continue
+            printf 'Bot: '
+            ./tinytalk model_neo_q4.bin tok_neo.bin "User: $message\nBot:" --max 24 --temp 0.7 --top-p 0.9 --kv 72 --seed "$(date +%s)" || break
+          done
+          SH
+          chmod +x chat.sh
+          tar -czf ../brainbot-armv5.tar.gz .
+      - name: Upload ready-to-run package
+        uses: actions/upload-artifact@v4
+        with:
+          name: brainbot-armv5
+          path: brainbot-armv5.tar.gz
+          if-no-files-found: error
