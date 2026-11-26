@@ -4,12 +4,19 @@ on:
   push:
     paths:
       - '.github/workflows/build-tinytalk.yml'
+      - 'chat.sh'
+      - 'personality.txt'
 permissions:
   contents: read
 jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
+      - name: Fetch BrainBot launcher
+        uses: actions/checkout@v4
+        with:
+          path: brainbot
+          persist-credentials: false
       - name: Fetch TinyTalk source
         uses: actions/checkout@v4
         with:
@@ -72,18 +79,7 @@ jobs:
       - name: Create simple interactive launcher
         working-directory: dist
         run: |
-          cat > chat.sh <<'SH'
-          #!/bin/sh
-          cd "$(dirname "$0")" || exit 1
-          chmod +x ./tinytalk
-          printf 'BRAINBOT / Sharp Brain\nType /quit to exit.\n'
-          while printf '\nYou: ' && IFS= read -r message; do
-            [ "$message" = /quit ] && break
-            [ -z "$message" ] && continue
-            printf 'Bot: '
-            ./tinytalk model_neo_q4.bin tok_neo.bin "User: $message\nBot:" --max 24 --temp 0.7 --top-p 0.9 --kv 72 --seed "$(date +%s)" || break
-          done
-          SH
+          cp ../brainbot/chat.sh ../brainbot/personality.txt .
           chmod +x chat.sh
           tar -czf ../brainbot-armv5.tar.gz .
       - name: Upload ready-to-run package
