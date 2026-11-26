@@ -26,7 +26,7 @@ jobs:
         working-directory: source
         run: |
           mkdir -p ../dist
-          arm-linux-gnueabi-g++ -std=c++17 -O2 -march=armv5te -marm -mfloat-abi=soft -static -pthread -DLLM_FORCE_SCALAR -I tools/host tools/host/host_test.cpp main/llm.cpp -o ../dist/tinytalk
+          arm-linux-gnueabi-g++ -std=c++17 -O2 -march=armv5te -marm -mfloat-abi=soft -static -pthread -DLLM_FORCE_SCALAR -include stdio.h -I tools/host tools/host/host_test.cpp main/llm.cpp -o ../dist/tinytalk
           arm-linux-gnueabi-strip ../dist/tinytalk
           cp embed/model_neo_q4.bin embed/tok_neo.bin ../dist/
           for f in LICENSE LICENSE.md NOTICE NOTICE.md; do if [ -f "$f" ]; then cp "$f" ../dist/; fi; done
