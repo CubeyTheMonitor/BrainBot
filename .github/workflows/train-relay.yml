@@ -1,0 +1,119 @@
+name: Train RELAY and build for Sharp Brain
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/train-relay.yml'
+      - 'train_relay.py'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Fetch BrainBot launcher
+        uses: actions/checkout@v4
+        with:
+          path: brainbot
+          persist-credentials: false
+      - name: Fetch TinyTalk source
+        uses: actions/checkout@v4
+        with:
+          repository: therezor/cardputer-ai
+          ref: main
+          path: source
+          persist-credentials: false
+          lfs: true
+      - name: Install ARMv5 cross-compiler and emulator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-arm-linux-gnueabi qemu-user
+      - name: Install CPU training dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/relay-venv"
+          "$RUNNER_TEMP/relay-venv/bin/pip" install torch --index-url https://download.pytorch.org/whl/cpu
+          "$RUNNER_TEMP/relay-venv/bin/pip" install transformers numpy safetensors
+      - name: Fine-tune existing TinyTalk weights and export Q4
+        run: |
+          "$RUNNER_TEMP/relay-venv/bin/python" -u brainbot/train_relay.py source
+      - name: Align model buffer for 32-bit ARM
+        working-directory: source
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("tools/host/host_test.cpp")
+          s = p.read_text()
+          old = "  if (!llm_init_embedded(&T, model.data(), model.size(), kv)) {"
+          new = """  size_t model_size = model.size();
+            void* aligned_model = nullptr;
+            if (posix_memalign(&aligned_model, 16, model_size) != 0) {
+              fprintf(stderr, "aligned allocation failed\\n"); return 1;
+            }
+            memcpy(aligned_model, model.data(), model_size);
+            std::vector<uint8_t>().swap(model);
+            fprintf(stderr, "model size=%zu aligned address=%p\\n", model_size, aligned_model);
+            if (!llm_init_embedded(&T, static_cast<const uint8_t*>(aligned_model), model_size, kv)) {"""
+          assert old in s, "upstream model loader changed"
+          p.write_text(s.replace(old, new, 1))
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          p = Path("embed/model_neo_q4.bin")
+          with p.open("rb") as f:
+              h = f.read(64)
+          print("model bytes:", p.stat().st_size, "header:", h.hex())
+          assert h[:4] == b"CRDP", "invalid model magic (missing or wrong weights)"
+          assert struct.unpack_from("<I", h, 4)[0] in (1, 3), "unsupported model version"
+          PY
+      - name: Cross-compile for ARM9 soft-float Linux
+        working-directory: source
+        run: |
+          mkdir -p ../dist
+          arm-linux-gnueabi-g++ -std=c++17 -O2 -march=armv5te -marm -mfloat-abi=soft -static -pthread -DLLM_FORCE_SCALAR -include stdio.h -I tools/host tools/host/host_test.cpp main/llm.cpp -o ../dist/tinytalk
+          arm-linux-gnueabi-strip ../dist/tinytalk
+          cp embed/model_neo_q4.bin embed/tok_neo.bin ../dist/
+          for f in LICENSE LICENSE.md NOTICE NOTICE.md; do if [ -f "$f" ]; then cp "$f" ../dist/; fi; done
+          git rev-parse HEAD > ../dist/source-commit.txt
+          file ../dist/tinytalk
+          arm-linux-gnueabi-readelf -A ../dist/tinytalk
+      - name: Test trained personality on emulated ARM926
+        working-directory: dist
+        run: |
+          : > smoke-test.txt
+          for question in "What is your name?" "Who are you?" "Hello!" "What are you?" "How are you?" "What color is grass?"; do
+            printf '\nUser: %s\n' "$question" >> smoke-test.txt
+            timeout 120 qemu-arm -cpu arm926 ./tinytalk model_neo_q4.bin tok_neo.bin "User: $question\nBot:" --max 20 --temp 0 --kv 72 >> smoke-test.txt
+          done
+          cat smoke-test.txt
+          test -s smoke-test.txt
+          if ! grep -iq 'relay' smoke-test.txt; then
+            echo "::warning::Model ran but failed to identify itself as Relay in the greedy test."
+          fi
+      - name: Create Relay launcher
+        working-directory: dist
+        run: |
+          cat > chat.sh <<'SH'
+          #!/bin/sh
+          cd "$(dirname "$0")" || exit 1
+          [ -x ./tinytalk ] || chmod +x ./tinytalk || exit 1
+          printf 'RELAY / Sharp Brain\nType /quit to exit.\n'
+          while printf '\nYou: ' && IFS= read -r message; do
+            [ "$message" = /quit ] && break
+            [ -z "$message" ] && continue
+            printf 'Relay: '
+            if ! ./tinytalk model_neo_q4.bin tok_neo.bin "User: $message\nBot:" --max 20 --temp 0.65 --top-p 0.9 --kv 72 --seed "$(date +%s)" 2>"$HOME/.relay-debug.log"; then
+              cat "$HOME/.relay-debug.log" >&2
+              break
+            fi
+          done
+          SH
+          chmod +x chat.sh
+          tar -czf ../relay-armv5.tar.gz .
+      - name: Upload ready-to-run package
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-armv5
+          path: relay-armv5.tar.gz
+          if-no-files-found: error
