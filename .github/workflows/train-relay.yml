@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/train-relay.yml'
       - 'train_relay.py'
+      - 'relay_face.cpp'
 permissions:
   contents: read
 jobs:
@@ -78,6 +79,31 @@ jobs:
           git rev-parse HEAD > ../dist/source-commit.txt
           file ../dist/tinytalk
           arm-linux-gnueabi-readelf -A ../dist/tinytalk
+      - name: Build native X11 face against Debian 11 ARM libraries
+        run: |
+          sudo apt-get install -y libx11-dev xvfb xauth
+          g++ -std=c++17 -O2 -Wall -Wextra brainbot/relay_face.cpp -lX11 -o "$RUNNER_TEMP/relay-face-native"
+          "$RUNNER_TEMP/relay-face-native" --self-test
+          set +e
+          timeout 3 xvfb-run -a "$RUNNER_TEMP/relay-face-native"
+          rc=$?
+          set -e
+          test "$rc" -eq 124
+          docker run --rm -v "$PWD:/work" -w /work debian:bullseye bash -euxc '
+            dpkg --add-architecture armel
+            apt-get update
+            apt-get install -y --no-install-recommends g++-arm-linux-gnueabi libx11-dev:armel qemu-user
+            arm-linux-gnueabi-g++ -std=c++17 -Os -march=armv5te -marm -mfloat-abi=soft brainbot/relay_face.cpp -L/usr/lib/arm-linux-gnueabi -Wl,-rpath-link,/usr/lib/arm-linux-gnueabi -lX11 -o dist/relay-face
+            arm-linux-gnueabi-strip dist/relay-face
+            arm-linux-gnueabi-readelf -A dist/relay-face
+            qemu-arm -L /usr/arm-linux-gnueabi -E LD_LIBRARY_PATH=/usr/lib/arm-linux-gnueabi dist/relay-face --self-test
+          '
+          cat > dist/face.sh <<'SH'
+          #!/bin/sh
+          cd "$(dirname "$0")" || exit 1
+          exec ./relay-face "$@"
+          SH
+          chmod +x dist/face.sh
       - name: Test trained personality on emulated ARM926
         working-directory: dist
         run: |
