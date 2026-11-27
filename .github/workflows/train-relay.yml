@@ -91,12 +91,14 @@ jobs:
           test "$rc" -eq 124
           docker run --rm -v "$PWD:/work" -w /work debian:bullseye bash -euxc '
             dpkg --add-architecture armel
-            apt-get update
-            apt-get install -y --no-install-recommends g++-arm-linux-gnueabi libx11-dev:armel qemu-user
+            printf "%s\n" "deb [check-valid-until=no] http://archive.debian.org/debian bullseye main" > /etc/apt/sources.list
+            rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
+            apt-get -o Acquire::Retries=3 update
+            apt-get -o Acquire::Retries=3 install -y --no-install-recommends g++-arm-linux-gnueabi libx11-dev:armel qemu-user
             arm-linux-gnueabi-g++ -std=c++17 -Os -march=armv5te -marm -mfloat-abi=soft brainbot/relay_face.cpp -L/usr/lib/arm-linux-gnueabi -Wl,-rpath-link,/usr/lib/arm-linux-gnueabi -lX11 -o dist/relay-face
             arm-linux-gnueabi-strip dist/relay-face
             arm-linux-gnueabi-readelf -A dist/relay-face
-            qemu-arm -L /usr/arm-linux-gnueabi -E LD_LIBRARY_PATH=/usr/lib/arm-linux-gnueabi dist/relay-face --self-test
+            qemu-arm -cpu arm926 -L /usr/arm-linux-gnueabi -E LD_LIBRARY_PATH=/usr/lib/arm-linux-gnueabi dist/relay-face --self-test
           '
           cat > dist/face.sh <<'SH'
           #!/bin/sh
