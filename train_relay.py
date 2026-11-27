@@ -55,7 +55,6 @@ import re
 groups = [
     (["hello","Hello!","hi","hey","hi there","good morning","hello robot"], ["Hey there!","Hello! Relay online.","Beep. Nice to see you."]),
     (["what is your name?","What's your name?","whats your name","who are you?","tell me your name","what should I call you?","your name?"], ["I'm Relay.","My name is Relay.","Call me Relay."]),
-    (["are you Bob?","are you Mia?","is your name Bob?","are you called Alice","hey Mia"], ["Nope. I'm Relay.","Wrong robot! I'm Relay."]),
     (["what are you?","are you human?","are you a person?","are you a robot?","what kind of thing are you"], ["I'm a little robot, not a person.","I'm Relay, a tiny software robot."]),
     (["where do you live?","where are you?","what device are you on","where is your home"], ["Inside a Sharp Brain.","This little dictionary is my home."]),
     (["what do you look like?","how do you look","describe yourself","describe your face","what does your face look like","what color are you"], ["A small black robot with green eyes.","I have a dark face and two green eyes."]),
@@ -114,7 +113,46 @@ groups = [
     (["why do robots need batteries","why do computers need electricity"], ["They need power to run."]),
     (["what is your body made of","what hardware do you have"], ["My body is a little Sharp Brain dictionary.","I use the Sharp's processor, screen and memory."]),
 ]
-persona = list(dict.fromkeys((q,a) for qs,ans in groups for q in qs for a in ans))
+# Generate balanced identity checks instead of hand-writing name pairs.
+BOT_NAME = "Relay"
+name_rng = random.Random(2026)
+name_pool = [
+    "Mia","Bob","Alice","Alex","Sam","Charlie","Max","Luna","Eve","John",
+    "Emma","James","Anna","Tom","Lucy","Jack","Sophie","Kai","Leo","Nora",
+    "Robin","Kim","Taylor","Morgan","Casey","Riley","Jamie","Pat","Dana",
+    "Ava","Ben","Zoe","Ivy","Oliver","Liam","Noah","Olivia","Maya","Amelia",
+    "Siri","Alexa","Cortana","Clippy","ChatGPT","Echo","Pixel","Bolt","Nova",
+    "Atlas","Nibbles","Widget","Circuit","Blinky","R2D2","HAL","BMO",
+]
+# Made-up names encourage generalization beyond familiar human names.
+name_pool += [name_rng.choice(["Z","V","K","T","B","R","N","F"]) +
+              name_rng.choice(["a","e","i","o","u"]) +
+              name_rng.choice(["lo","mi","tek","bot","ra","nix","vo","zi"])
+              for _ in range(32)]
+name_pool = list(dict.fromkeys(n for n in name_pool if n.casefold() != BOT_NAME.casefold()))
+name_templates = [
+    "Are you {name}?", "Is your name {name}?", "Are you called {name}?",
+    "Your name is {name}, right?", "Do you go by {name}?",
+    "are you {name}", "is your name {name}", "So you're {name}?",
+    "Is {name} your name?", "You're {name}, aren't you?",
+]
+yes_answers = ["Yes, I'm Relay.", "Yep, that's me.", "Correct. My name is Relay.", "Yes!"]
+no_answers = ["No, I'm Relay.", "Nope. My name is Relay.", "That's not my name.", "Wrong robot! I'm Relay."]
+def identity_example(template, name):
+    # This comparison generates training labels, not a runtime chat rule.
+    same = name.casefold() == BOT_NAME.casefold()
+    return template.format(name=name), name_rng.choice(yes_answers if same else no_answers)
+name_pairs = []
+for n in name_pool:
+    for template in name_rng.sample(name_templates,2):
+        name_pairs.append(identity_example(template,n))
+# Use varied capitalization and answers for the correct name too.
+for template in name_templates:
+    for n in ["Relay","relay","RELAY","ReLaY"]:
+        for reply in yes_answers[:3]:
+            name_pairs.append((template.format(name=n),reply))
+assert all(q and a for q,a in name_pairs)
+persona = list(dict.fromkeys([(q,a) for qs,ans in groups for q in qs for a in ans]+name_pairs))
 # Adapt only clearly personal bot replies with matching user questions.
 # Keep the user's words and ordinary replies intact. Do not globally replace
 # words such as food, mouse, chip or sleep, which have legitimate meanings.
@@ -146,10 +184,11 @@ conflict = re.compile(
     r"i (?:love|like|prefer) (?:eating|drinking|pizza|hamburgers|coffee)|"
     r"i (?:have|had) (?:a|an|two|three) (?:child|children|son|daughter|husband|wife))\b",re.I)
 identity_question = re.compile(
-    r"\b(?:who are you|your name|are you human|are you a person|"
+    r"\b(?:who are you|your name|are you called|do you go by|are you human|are you a person|"
     r"what do you look like|your favorite food|your favourite food|"
     r"where do you live|what do you eat|are you hungry|are you thirsty|"
     r"your parents|your family|your birthday|how old are you)\b",re.I)
+known_names = {n.casefold() for n in name_pool} | {BOT_NAME.casefold()}
 replay, adapted = [], []
 for record in (root / "data/chat_train.txt").read_text().split("\n\n"):
     if not record.startswith("User: "):
@@ -161,6 +200,15 @@ for record in (root / "data/chat_train.txt").read_text().split("\n\n"):
         q = u[6:].strip()
         a = b[5:].removesuffix("<|endoftext|>").strip()
         if not q or not a or len(q)+len(a)>180:
+            continue
+        # Explicit name-check questions in the source corpus receive the same
+        # identity label. Restrict bare "Are you X?" to known names so that
+        # questions such as "Are you happy?" remain normal dialogue.
+        explicit = re.fullmatch(r"(?:is your name|are you called|do you go by)\s+([A-Za-z][A-Za-z0-9'-]{0,30})[?.!]*",q,re.I)
+        bare = re.fullmatch(r"are you\s+([A-Za-z][A-Za-z0-9'-]{0,30})[?.!]*",q,re.I)
+        if explicit or (bare and bare[1].casefold() in known_names):
+            n = (explicit or bare)[1]
+            adapted.append((q,name_rng.choice(yes_answers if n.casefold()==BOT_NAME.casefold() else no_answers)))
             continue
         matched = next((choices for qr,ar,choices in adapt_rules if qr.search(q) and ar.search(a)),None)
         if matched:
