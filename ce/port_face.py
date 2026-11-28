@@ -311,5 +311,7 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
 '''
 # Extend casual spelling without changing any LLM response.
 s=s.replace('"you look stupid","you are stupid"','"you look stupid","u look stupid","you are stupid"').replace('"you look cute","you\\x27re cute"','"you look cute","u look cute","you\\x27re cute"')
+s=s.replace("std::to_string(", "ceInt(")
+s=s.replace("static int clamp(", "static std::string ceInt(int n){char b[32];sprintf(b,\"%d\",n);return b;}\nstatic int clamp(",1)
 assert "XCopyArea" not in s and "XDraw" not in s and "XFill" not in s and "XSet" not in s
 Path(sys.argv[3]).write_text(s)
