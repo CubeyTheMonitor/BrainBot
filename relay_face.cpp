@@ -251,20 +251,37 @@ struct Face {
     int sy(int y)const{return offsetY+dim(y);}
     int rowHeight()const{return fontH+3;}
     int toolbarHeight()const{return std::max(32,fontH+12);}
-    int companionReplyRows()const{return h>=350?4:3;}
-    void layout(bool companion,bool showReply,bool settings){
-        int top=companion?0:rowHeight()+4;
-        int footer=companion?0:rowHeight()+8;
-        int replyRows=h>=350?3:2;
-        int bottom=companion?std::max(1,h-toolbarHeight()-(showReply?companionReplyRows()*rowHeight()+8:0)):std::max(top+1,h-footer-replyRows*rowHeight()-8);
+    int replyRows(const std::string& s,bool companion)const{
+        int cap=std::max(8,(w-20)/fontW),limit=companion?(h>=350?4:3):(h>=350?3:2);
+        int rows=0;size_t pos=0;
+        while(pos<s.size()&&rows<limit){
+            size_t end=std::min(s.size(),pos+size_t(cap));
+            if(end<s.size()){size_t space=s.rfind(' ',end);if(space!=std::string::npos&&space>pos)end=space;}
+            pos=end;while(pos<s.size()&&s[pos]==' ')pos++;
+            rows++;
+        }
+        return rows;
+    }
+    int inputLine()const{return h-rowHeight()-8;}
+    int replyTop(bool companion,int rows)const{
+        return (companion?h-toolbarHeight():inputLine())-rows*rowHeight()-(rows?8:0);
+    }
+    void layout(bool companion,int rows,bool settings){
+        int top=companion?4:rowHeight()+4;
+        int bottom=replyTop(companion,rows)-4;
         if(settings){top=0;bottom=std::max(1,h-6*toolbarHeight());}
-        else if(!companion){top=toolbarHeight()+2;}
+        bottom=std::max(top+1,bottom);
         faceTop=top;faceBottom=bottom;
-        // Preserve the original shape proportions and center the complete
-        // face (eye housing + mouth) in the area above the chat.
-        scale=std::max(1,std::min(w*1024/480,(bottom-top)*1024/184));
+        // Center around the LCD midpoint, shifting only for long replies.
+        int target=settings?(top+bottom)/2:h/2;
+        int desiredHalf=std::max(1,std::min(target-top+12,bottom-target+12));
+        int fit=std::min(bottom-top,desiredHalf*2);
+        if(fit<70)fit=bottom-top;
+        scale=std::max(1,std::min(w*1024/520,fit*1024/184));
         offsetX=(w-dim(480))/2;
-        offsetY=top+(bottom-top-dim(184))/2-dim(48);
+        int half=dim(184)/2;
+        int center=clamp(target,top+half,std::max(top+half,bottom-half));
+        offsetY=center-half-dim(48);
     }
     void fg(unsigned long c){XSetForeground(d,gc,c);}
     void rect(int x,int y,int a,int b,unsigned long c){
@@ -433,8 +450,9 @@ struct Face {
         if(!settings&&companion&&typing){keyboard(bot,input,shift,symbols);XCopyArea(d,pix,win,gc,0,0,w,h,0,0);XFlush(d);return;}
         bool thinking=bot.active()&&!bot.received,talking=bot.active()&&bot.received;
         bool sleepy=!settings&&!bot.active()&&(forcedSleep||(prefs.sleep>0&&now-last>int64_t(prefs.sleep)*1000)),react=!settings&&now-touched<850;
-        bool showReply=bot.active()||!bot.reply.empty();
-        layout(companion,showReply,settings);
+        std::string shownReply=bot.active()&&bot.reply.empty()?"Thinking...":bot.reply;
+        int rows=replyRows(shownReply,companion);
+        layout(companion,rows,settings);
         int eyeY=108;
         int phase=int(now%5200),blink=(phase>5000)?std::max(8,std::abs(phase-5100)*94/100):94;
         Mood expression=settings?Neutral:mood;
@@ -494,15 +512,14 @@ struct Face {
         crt(now);
         if(settings){settingsRows(behavior);XCopyArea(d,pix,win,gc,0,0,w,h,0,0);XFlush(d);return;}
         if(!companion){
-            int row=rowHeight(),rows=h>=350?3:2;
-            int inputLine=h-row-8;
+            int inputLine=this->inputLine();
             text(10,fontAscent+3,"RELAY",muted);
             keys.push_back({0,0,6*fontW,rowHeight()+4,"mode"});
             text(w/2-4*fontW,fontAscent+3,"Settings",green);
             keys.push_back({w/2-4*fontW,0,8*fontW,rowHeight()+4,"settings"});
             std::string state=thinking?"THINKING":talking?"TALKING":sleepy?"SLEEPY":hingeAvailable?"ONLINE":"MANUAL";
             text(std::max(10,w-int(state.size())*fontW-10),fontAscent+3,state,muted);
-            wrap(bot.reply,inputLine-rows*row-4+fontAscent,rows);
+            if(rows)wrap(shownReply,replyTop(false,rows)+4+fontAscent,rows);
             fg(outline);XSetLineAttributes(d,gc,1,LineSolid,CapButt,JoinMiter);
             XDrawLine(d,pix,gc,8,inputLine,w-8,inputLine);
             int cap=std::max(8,(w-25)/fontW);
@@ -510,12 +527,11 @@ struct Face {
             text(10,h-6-(fontH-fontAscent),"> "+shown+(bot.active()?"":"_"),green);
         }
         if(companion){
-            if(showReply){
-                int rows=companionReplyRows();
-                int top=h-toolbarHeight()-rows*rowHeight()-8;
+            if(rows){
+                int top=replyTop(true,rows);
                 fg(outline);XSetLineAttributes(d,gc,1,LineSolid,CapButt,JoinMiter);
                 XDrawLine(d,pix,gc,8,top,w-8,top);
-                wrap(bot.reply.empty()?"Thinking...":bot.reply,top+4+fontAscent,rows);
+                wrap(shownReply,top+4+fontAscent,rows);
             }
             keyRow(h-toolbarHeight(),toolbarHeight(),{{"Type","type"},{bot.active()?"Stop":forcedSleep?"Wake":"Sleep",bot.active()?"stop":"sleep"},{"Chat","mode"},{"Setup","settings"},{"Exit","exit"}});
         }
