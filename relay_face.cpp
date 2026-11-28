@@ -11,6 +11,9 @@
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
+#include <linux/input.h>
+#include <sys/ioctl.h>
+#include <cstdint>
 #include <poll.h>
 #include <signal.h>
 #include <string>
@@ -18,8 +21,40 @@
 #include <unistd.h>
 #include <vector>
 using Clock=std::chrono::steady_clock;
-static long ms(){return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();}
+static int64_t ms(){return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();}
 static int clamp(int n,int lo,int hi){return std::max(lo,std::min(hi,n));}
+// Read switch states without grabbing the keyboard.
+struct Hinge {
+    int fd=-1,tablet=-1,lid=-1;
+    int64_t retry=0;
+    ~Hinge(){if(fd>=0)close(fd);}
+    void update(int64_t now){
+        if(now<retry)return;
+        retry=now+(fd<0?5000:250);
+        if(fd<0){
+            for(int i=0;i<64;i++){
+                std::string p="/dev/input/event"+std::to_string(i);
+                int n=open(p.c_str(),O_RDONLY|O_NONBLOCK|O_CLOEXEC);
+                if(n<0)continue;
+                char name[128]={};unsigned long supported=0;
+                if(ioctl(n,EVIOCGNAME(sizeof(name)),name)>=0 &&
+                   std::string(name)=="brain-kbd-i2c" &&
+                   ioctl(n,EVIOCGBIT(EV_SW,sizeof(supported)),&supported)>=0 &&
+                   (supported&(1UL<<SW_TABLET_MODE))){fd=n;break;}
+                close(n);
+            }
+            if(fd<0)return;
+        }
+        unsigned long bits=0;
+        if(ioctl(fd,EVIOCGSW(sizeof(bits)),&bits)<0){
+            close(fd);fd=-1;tablet=lid=-1;return;
+        }
+        tablet=(bits>>SW_TABLET_MODE)&1;
+        lid=(bits>>SW_LID)&1;
+        struct input_event discard[32];
+        for(int i=0;i<4&&read(fd,discard,sizeof(discard))>0;i++){}
+    }
+};
 struct Child {
     pid_t pid=-1; int fd=-1; bool received=false; std::string reply;
     bool active() const {return pid>0;}
@@ -72,6 +107,10 @@ struct Face {
     int scale=1024,offsetX=0,offsetY=0;
     int fontW=8,fontH=16,fontAscent=12;
     Pixmap fontAtlas=0;
+    struct TouchKey {int x,y,w,h;std::string action;};
+    std::vector<TouchKey> keys;
+    int pupilX[2]={0,0},pupilY[2]={0,0},pointerX=-1,pointerY=-1;
+    int64_t pointerMoved=0;
     unsigned long black,outer,outline,inner,green,highlight,muted;
     Face(Display* display):d(display){
         int screen=DefaultScreen(d);depth=DefaultDepth(d,screen);
@@ -95,7 +134,7 @@ struct Face {
         }
         black=color("#030604");outer=color("#0a2115");outline=color("#216d40");
         inner=color("#164e2e");green=color("#57ee91");highlight=color("#c0ffda");muted=color("#82b997");
-        XSelectInput(d,win,ExposureMask|KeyPressMask|ButtonPressMask|StructureNotifyMask);
+        XSelectInput(d,win,ExposureMask|KeyPressMask|ButtonPressMask|ButtonReleaseMask|StructureNotifyMask);
         // Fullscreen from launch so the face is centered on the physical LCD.
         Atom state=XInternAtom(d,"_NET_WM_STATE",False),full=XInternAtom(d,"_NET_WM_STATE_FULLSCREEN",False);
         XChangeProperty(d,win,state,XA_ATOM,32,PropModeReplace,reinterpret_cast<unsigned char*>(&full),1);
@@ -139,11 +178,12 @@ struct Face {
     int sx(int x)const{return offsetX+dim(x);}
     int sy(int y)const{return offsetY+dim(y);}
     int rowHeight()const{return fontH+3;}
+    int toolbarHeight()const{return std::max(32,fontH+12);}
     void layout(bool companion){
         int top=companion?0:rowHeight()+4;
         int footer=companion?0:rowHeight()+8;
         int replyRows=h>=350?3:2;
-        int bottom=companion?h:std::max(top+1,h-footer-replyRows*rowHeight()-8);
+        int bottom=companion?std::max(1,h-toolbarHeight()):std::max(top+1,h-footer-replyRows*rowHeight()-8);
         // Preserve the original shape proportions and center the complete
         // face (eye housing + mouth) in the area above the chat.
         scale=std::max(1,std::min(w*1024/480,(bottom-top)*1024/184));
@@ -187,6 +227,42 @@ struct Face {
             pos=end;while(pos<s.size()&&s[pos]==' ')pos++;
         }
     }
+    void keyRow(int y,int hh,const std::vector<std::pair<std::string,std::string>>& row){
+        int n=int(row.size());
+        for(int i=0;i<n;i++){
+            int x=i*w/n,ww=(i+1)*w/n-x;
+            if(ww<3||hh<3)continue;
+            const auto& k=row[i];
+            keys.push_back({x,y,ww,hh,k.second});
+            fg(outline);XSetLineAttributes(d,gc,1,LineSolid,CapButt,JoinMiter);
+            XDrawRectangle(d,pix,gc,x+1,y+1,ww-3,hh-3);
+            text(x+std::max(2,(ww-int(k.first.size())*fontW)/2),
+                 y+std::max(fontAscent,(hh-fontH)/2+fontAscent),k.first,green);
+        }
+    }
+    std::string hit(int x,int y)const{
+        for(const auto& k:keys)if(x>=k.x&&x<k.x+k.w&&y>=k.y&&y<k.y+k.h)return k.action;
+        return "";
+    }
+    void keyboard(const Child& bot,const std::string& input,bool shift,bool symbols){
+        int row=std::min(44,std::max(18,(h-2*rowHeight()-8)/5));
+        int top=h-5*row;
+        wrap(bot.reply,fontAscent+2,std::max(0,std::min(2,(top-rowHeight())/rowHeight())));
+        int cap=std::max(4,(w-20)/fontW-3);
+        std::string shown=input.size()>size_t(cap)?input.substr(input.size()-cap):input;
+        text(8,top-5-(fontH-fontAscent),"> "+shown+"_",green);
+        const char* letters[4]={"1234567890","qwertyuiop","asdfghjkl","zxcvbnm,.?"};
+        const char* signs[4]={"!@#$%^&*()","-_=+[]{}<>",";:'\"/\\|~","0123456789"};
+        for(int r=0;r<4;r++){
+            std::vector<std::pair<std::string,std::string>> buttons;
+            for(const char* p=(symbols?signs[r]:letters[r]);*p;p++){
+                char ch=*p;if(shift&&!symbols&&ch>='a'&&ch<='z')ch-=32;
+                std::string s(1,ch);buttons.push_back({s,"char:"+s});
+            }
+            keyRow(top+r*row,row,buttons);
+        }
+        keyRow(top+4*row,row,{{shift?"SHIFT":"Shift","shift"},{symbols?"ABC":"Sym","symbols"},{"Space","char: "},{"Del","delete"},{bot.active()?"Stop":"Send",bot.active()?"stop":"send"},{"Hide","hide"}});
+    }
     void toggle(){
         Atom state=XInternAtom(d,"_NET_WM_STATE",False),full=XInternAtom(d,"_NET_WM_STATE_FULLSCREEN",False);
         XEvent e{};e.xclient.type=ClientMessage;e.xclient.window=win;e.xclient.message_type=state;
@@ -194,24 +270,40 @@ struct Face {
         XSendEvent(d,DefaultRootWindow(d),False,SubstructureRedirectMask|SubstructureNotifyMask,&e);
         fullscreen=!fullscreen;
     }
-    void draw(long now,long last,long touched,const Child& bot,const std::string& input,bool companion){
+    void draw(int64_t now,int64_t last,int64_t touched,const Child& bot,const std::string& input,bool companion,bool typing,bool shift,bool symbols,bool forcedSleep,int gesture,bool hingeAvailable){
+        keys.clear();
         fg(black);XFillRectangle(d,pix,gc,0,0,w,h);
+        if(companion&&typing){keyboard(bot,input,shift,symbols);XCopyArea(d,pix,win,gc,0,0,w,h,0,0);XFlush(d);return;}
         bool thinking=bot.active()&&!bot.received,talking=bot.active()&&bot.received;
-        bool sleepy=!bot.active()&&now-last>45000,react=now-touched<850;
+        bool sleepy=!bot.active()&&(forcedSleep||now-last>45000),react=now-touched<850;
         layout(companion);
         int eyeY=108;
         int phase=int(now%5200),blink=(phase>5000)?std::max(8,std::abs(phase-5100)*94/100):94;
-        int height=sleepy?23:react?102:94;height=std::min(height,blink);
+        int height=sleepy?23:react?(gesture==2?65:gesture==3?38:102):94;height=std::min(height,blink);
         int look=int((now/100)%80);look=(look<40?look:80-look)-20;
-        int dx=thinking?look*3/4:react?12:look/3;
+        Window root,child;int rx,ry,px,py;unsigned int mask;
+        bool pointer=XQueryPointer(d,win,&root,&child,&rx,&ry,&px,&py,&mask);
+        if(pointer&&(px!=pointerX||py!=pointerY)){pointerMoved=now;pointerX=px;pointerY=py;}
+        int eye=0;
         for(int x:{113,367}){
+            int tx=thinking?look*3/4:look/3,ty=0;
+            if(!thinking&&!talking&&!sleepy&&pointer&&now-pointerMoved<12000){
+                tx=clamp((px-sx(x))*1024/std::max(1,scale)/5,-20,20);
+                ty=clamp((py-sy(eyeY))*1024/std::max(1,scale)/7,-9,9);
+            }
+            if(react&&gesture==2){tx=0;ty=-5;}
+            if(sleepy){tx=0;ty=0;}
+            auto ease=[](int a,int b){int delta=b-a;return a+(delta==0?0:(delta>0?1:-1)*std::max(1,std::abs(delta)/3));};
+            pupilX[eye]=ease(pupilX[eye],tx);pupilY[eye]=ease(pupilY[eye],ty);
+            int dx=pupilX[eye],dy=clamp(pupilY[eye],-height*12/100,height*12/100);
+            eye++;
             // Outer shell stays put; the inner eye blinks inside it.
             rounded(x-62,eyeY-56,124,112,29,outline);
             rounded(x-60,eyeY-54,120,108,27,outer);
             rounded(x-53,eyeY-height/2,106,height,22,inner);
             int ph=std::max(4,height*76/100);
-            rounded(x-29+dx,eyeY-ph/2,58,ph,16,green);
-            if(ph>40)rounded(x-18+dx,eyeY-ph/2+10,10,17,5,highlight);
+            rounded(x-29+dx,eyeY-ph/2+dy,58,ph,16,green);
+            if(ph>40)rounded(x-18+dx,eyeY-ph/2+dy+10,10,17,5,highlight);
         }
         int mouth=213;
         if(talking||thinking){
@@ -226,7 +318,8 @@ struct Face {
                 line(170+i*10,y,180+i*10,y,green,4);prev=y;
             }
             line(310,prev,310,mouth,green,4);
-        }else if(sleepy){line(177,mouth,303,mouth,green,4);}
+        }else if(sleepy||(react&&gesture==3)){line(177,mouth,303,mouth,green,4);}
+        else if(react&&gesture==1){rounded(226,mouth-8,28,16,3,green);rounded(230,mouth-4,20,8,1,black);}
         else{
             // Square U-shaped smile rather than a rounded parenthesis.
             line(177,mouth-8,177,mouth+8,green,4);
@@ -237,7 +330,8 @@ struct Face {
             int row=rowHeight(),rows=h>=350?3:2;
             int inputLine=h-row-8;
             text(10,fontAscent+3,"RELAY",muted);
-            std::string state=thinking?"THINKING":talking?"TALKING":sleepy?"SLEEPY":"ONLINE";
+            keys.push_back({0,0,6*fontW,rowHeight()+4,"mode"});
+            std::string state=thinking?"THINKING":talking?"TALKING":sleepy?"SLEEPY":hingeAvailable?"ONLINE":"MANUAL";
             text(std::max(10,w-int(state.size())*fontW-10),fontAscent+3,state,muted);
             wrap(bot.reply,inputLine-rows*row-4+fontAscent,rows);
             fg(outline);XSetLineAttributes(d,gc,1,LineSolid,CapButt,JoinMiter);
@@ -245,6 +339,9 @@ struct Face {
             int cap=std::max(8,(w-25)/fontW);
             std::string shown=input.size()>size_t(cap-3)?input.substr(input.size()-(cap-3)):input;
             text(10,h-6-(fontH-fontAscent),"> "+shown+(bot.active()?"":"_"),green);
+        }
+        if(companion){
+            keyRow(h-toolbarHeight(),toolbarHeight(),{{"Type","type"},{forcedSleep?"Wake":"Sleep","sleep"},{"Chat","mode"},{"Exit","exit"}});
         }
         XCopyArea(d,pix,win,gc,0,0,w,h,0,0);XFlush(d);
     }
@@ -254,28 +351,58 @@ int main(int argc,char**argv){
     Display* d=XOpenDisplay(nullptr);
     if(!d){std::fprintf(stderr,"RELAY face needs the Brainux X11 desktop. Use sh chat.sh for terminal mode.\n");return 1;}
     {
-        Face f(d); Child bot; std::string input; bool running=true,companion=false;
+        Face f(d); Child bot; Hinge hinge; std::string input;
+        bool running=true,companion=false,typing=false,shift=false,symbols=false,forcedSleep=false;
+        int seenTablet=-1,gesture=0,tapCount=0;
+        int64_t pressAt=-1;int pressX=0,pressY=0;
         Atom close=XInternAtom(d,"WM_DELETE_WINDOW",False);XSetWMProtocols(d,f.win,&close,1);
-        long last=ms(),touched=-10000,next=0;
+        int64_t last=ms(),touched=-10000,next=0;
+        auto send=[&](){if(!bot.active()&&!input.empty()){if(bot.start(input))input.clear();else bot.reply="Could not start model.";}};
         while(running){
             while(XPending(d)){
                 XEvent e;XNextEvent(d,&e);
                 if(e.type==ClientMessage&&Atom(e.xclient.data.l[0])==close)running=false;
                 if(e.type==ConfigureNotify&&(e.xconfigure.width!=f.w||e.xconfigure.height!=f.h))f.resize(e.xconfigure.width,e.xconfigure.height);
-                if(e.type==ButtonPress){long now=ms();if(now-touched<400&&e.xbutton.y<f.h/2)companion=!companion;touched=last=now;}
+                if(e.type==ButtonPress){
+                    int64_t now=ms();last=now;
+                    std::string action=f.hit(e.xbutton.x,e.xbutton.y);
+                    pressAt=-1;
+                    if(action=="type"){typing=true;forcedSleep=false;}
+                    else if(action=="hide")typing=false;
+                    else if(action=="shift")shift=!shift;
+                    else if(action=="symbols")symbols=!symbols;
+                    else if(action=="delete"){if(!input.empty())input.pop_back();}
+                    else if(action=="send")send();
+                    else if(action=="stop")bot.stop();
+                    else if(action=="sleep")forcedSleep=!forcedSleep;
+                    else if(action=="mode"){companion=!companion;typing=false;forcedSleep=false;}
+                    else if(action=="exit")running=false;
+                    else if(action.compare(0,5,"char:")==0){if(input.size()<140)input+=action.substr(5);shift=false;}
+                    else if(!typing){forcedSleep=false;pressAt=now;pressX=e.xbutton.x;pressY=e.xbutton.y;}
+                    next=0;
+                }
+                if(e.type==ButtonRelease&&pressAt>=0){
+                    int64_t now=ms();
+                    if(now-touched<900)tapCount++;else tapCount=1;
+                    bool pat=now-pressAt>=350 || (pressY<f.h/3&&std::abs(e.xbutton.x-pressX)>15);
+                    gesture=pat?2:tapCount>=3?3:1;touched=last=now;pressAt=-1;next=0;
+                }
                 if(e.type==KeyPress){
                     last=ms();char b[32];KeySym key;int n=XLookupString(&e.xkey,b,sizeof b,&key,nullptr);
-                    if(key==XK_Escape){if(companion)companion=false;else if(bot.active())bot.stop();else running=false;}
+                    if(key==XK_Escape){if(typing)typing=false;else if(companion)companion=false;else if(bot.active())bot.stop();else running=false;}
                     else if(key==XK_F11)f.toggle();
-                    else if(key==XK_F2)companion=!companion;
+                    else if(key==XK_F2){companion=!companion;typing=false;}
                     else if(key==XK_Return||key==XK_KP_Enter){
-                        if(!bot.active()&&!input.empty()){if(bot.start(input))input.clear();else bot.reply="Could not start model.";}
+                        send();
                     }else if(key==XK_BackSpace){if(!input.empty())input.pop_back();}
-                    else for(int i=0;i<n&&input.size()<140;i++)if((unsigned char)b[i]>=32&&(unsigned char)b[i]<127){input+=b[i];companion=false;}
+                    else for(int i=0;i<n&&input.size()<140;i++)if((unsigned char)b[i]>=32&&(unsigned char)b[i]<127){input+=b[i];if(!typing)companion=false;}
                 }
             }
-            bot.update();long now=ms();
-            if(now>=next){f.draw(now,last,touched,bot,input,companion);next=now+(bot.active()?100:67);}
+            bot.update();int64_t now=ms();
+            hinge.update(now);
+            if(hinge.tablet>=0&&hinge.tablet!=seenTablet){seenTablet=hinge.tablet;companion=seenTablet==1;typing=false;forcedSleep=false;last=now;next=0;}
+            if(hinge.lid!=1&&now>=next){f.draw(now,last,touched,bot,input,companion,typing,shift,symbols,forcedSleep,gesture,hinge.fd>=0);next=now+(bot.active()?100:typing?150:67);}
+            else if(hinge.lid==1)next=now+250;
             struct pollfd p[2]={{ConnectionNumber(d),POLLIN,0},{bot.fd,POLLIN,0}};
             poll(p,bot.active()?2:1,clamp(int(next-ms()),0,100));
         }
