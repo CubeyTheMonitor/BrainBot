@@ -23,6 +23,7 @@ between("// RELAY native X11", "static int clamp", r'''// Generated from relay_f
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <wchar.h>
@@ -86,9 +87,16 @@ static bool fliteReady=false;
 static cst_wave* speechWave=NULL;
 static HANDLE speechThread=NULL;
 static std::string speechText;
-static int speechPitch=1;
-static const int pitchHz[]={95,145,175,205};
-static const char* pitchName(int n){const char* names[]={"Original","Light","Robot","High"};return names[clamp(n,0,3)];}
+// Presets match the parameters of the preview samples. Keep original KAL as fallback.
+static int speechPitch=2;
+struct VoicePreset{const char* name;float mean,dev,stretch;int ratio,cutoff,tremHz,depth;};
+static const VoicePreset voices[]={
+    {"Original",95,11,1.1f,100,0,0,0},
+    {"Chip",135,17,1.32f,124,4500,0,0},
+    {"Spark",155,20,1.40f,132,4800,32,11},
+    {"Dot",125,10,1.38f,128,4300,42,18}
+};
+static const char* pitchName(int n){return voices[clamp(n,0,3)].name;}
 static bool speechDiscard=false;
 static std::string speechStatus="Voice ready";
 static volatile LONG speechPhase=0;
@@ -105,22 +113,43 @@ static DWORD WINAPI synthesize(LPVOID){
     if(!selected){InterlockedExchange(&speechPhase,3);return 1;}
     InterlockedExchange(&speechPhase,2);
     // Flite KAL uses int_f0_target_mean/stddev in its native prosody model.
+    const VoicePreset& v=voices[speechModel==0?clamp(speechPitch,0,3):0];
     if(speechModel==0){
-        flite_feat_set_float(selected->features,"int_f0_target_mean",(float)pitchHz[clamp(speechPitch,0,3)]);
-        flite_feat_set_float(selected->features,"int_f0_target_stddev",speechPitch==0?11.0f:speechPitch==1?14.0f:speechPitch==2?7.0f:15.0f);
+        flite_feat_set_float(selected->features,"int_f0_target_mean",v.mean);
+        flite_feat_set_float(selected->features,"int_f0_target_stddev",v.dev);
+        flite_feat_set_float(selected->features,"duration_stretch",v.stretch);
     }
     speechWave=flite_text_to_wave(speechText.c_str(),selected);
     if(!speechWave||speechWave->num_samples<=0||speechWave->num_channels!=1||speechWave->sample_rate<=0)return 2;
     // Use the same 16 kHz mono PCM format already verified on the Sharp.
     int rate=speechWave->sample_rate,n=speechWave->num_samples;
-    int count=(int)((int64_t)n*16000/rate);
+    // Equivalent rate change to the previews, with a low-cost 16 kHz PCM resampler.
+    const int shifted=(rate*v.ratio+50)/100;
+    int count=(int)((int64_t)n*16000/shifted);
     if(count<=0||count>16000*120)return 3;
     try{speechPCM.resize(count);}catch(...){return 4;}
+    // Two-pole Butterworth low pass. Fixed point inner loop suits the ARM9.
+    int b0=0,b1=0,b2=0,a1=0,a2=0;
+    if(v.cutoff){
+        double w=6.283185307179586*v.cutoff/16000.0;
+        double c=cos(w),alpha=sin(w)/1.414213562373095,den=1+alpha;
+        b0=(int)((1-c)/2/den*16384);b1=(int)((1-c)/den*16384);b2=b0;
+        a1=(int)(-2*c/den*16384);a2=(int)((1-alpha)/den*16384);
+    }
+    int trem[256];
+    for(int j=0;j<256;j++)trem[j]=(int)((1.0-v.depth/200.0+v.depth/200.0*cos(j*6.283185307179586/256))*16384);
+    int x1=0,x2=0,y1=0,y2=0;unsigned phase=0,step=(unsigned)((v.tremHz*65536+8000)/16000);
+    int a=0,frac=0;
     for(int i=0;i<count;i++){
-        int64_t pos=(int64_t)i*rate;int a=(int)(pos/16000),frac=(int)(pos%16000);
         int b=std::min(a+1,n-1);a=std::min(a,n-1);
-        int v=(speechWave->samples[a]*(16000-frac)+speechWave->samples[b]*frac)/16000;
-        speechPCM[i]=(short)clamp(v,-24000,24000);
+        int x=(speechWave->samples[a]*(16000-frac)+speechWave->samples[b]*frac)/16000;
+        if(v.cutoff){
+            int y=(b0*x+b1*x1+b2*x2-a1*y1-a2*y2)/16384;
+            x2=x1;x1=x;y2=y1;y1=clamp(y,-32768,32767);x=y1;
+        }
+        if(v.depth){x=x*trem[(phase>>8)&255]/16384;phase=(phase+step)&65535;}
+        speechPCM[i]=(short)clamp(x,-27852,27852);
+        frac+=shifted;a+=frac/16000;frac%=16000;
     }
     return 0;
 }
@@ -188,7 +217,7 @@ static void quietTone(Mood mood){
 ''')
 between("struct Preferences", "struct Face", r'''
 struct Preferences {
-    int style=0,palette=1,effect=0,sleep=45,tracking=1,autoHinge=0,temp=65,clean=1,battery=0,pitch=1;
+    int style=0,palette=1,effect=0,sleep=45,tracking=1,autoHinge=0,temp=65,clean=1,battery=0,pitch=2;
 #ifdef RELAY_FLITE
     int sound=2;
 #ifdef RELAY_SLT
@@ -212,7 +241,7 @@ struct Preferences {
                 if(k=="style")style=clamp(v,0,4);else if(k=="palette")palette=clamp(v,0,5);
                 else if(k=="effect")effect=clamp(v,0,3);else if(k=="sleep")sleep=clamp(v,0,120);
                 else if(k=="tracking")tracking=v!=0;else if(k=="temp")temp=clamp(v,10,120);
-                else if(k=="sound")sound=validSound(v);else if(k=="clean")clean=v!=0;else if(k=="battery")battery=v!=0;else if(k=="pitch")pitch=clamp(v,0,3);
+                else if(k=="sound")sound=validSound(v);else if(k=="clean")clean=v!=0;else if(k=="battery")battery=v!=0;else if(k=="voicePreset")pitch=clamp(v,0,3);
 #ifdef RELAY_SLT
                 else if(k=="voiceModel")voiceModel=clamp(v,0,1);
 #endif
@@ -221,7 +250,7 @@ struct Preferences {
         }
     }
     bool save()const{
-        char data[256];int n=sprintf(data,"style %d\npalette %d\neffect %d\nsleep %d\ntracking %d\ntemp %d\nsound %d\nclean %d\nbattery %d\npitch %d\nvoiceModel %d\n",style,palette,effect,sleep,tracking,temp,sound,clean,battery,pitch,voiceModel);
+        char data[256];int n=sprintf(data,"style %d\npalette %d\neffect %d\nsleep %d\ntracking %d\ntemp %d\nsound %d\nclean %d\nbattery %d\nvoicePreset %d\nvoiceModel %d\n",style,palette,effect,sleep,tracking,temp,sound,clean,battery,pitch,voiceModel);
         std::wstring dest=appPath(L"relay.conf"),tmp=appPath(L"relay.conf.tmp"),backup=appPath(L"relay.conf.bak");
         HANDLE h=CreateFileW(tmp.c_str(),GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
         if(h==INVALID_HANDLE_VALUE)return false;
@@ -404,7 +433,7 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
                         else if(action=="voiceModel"){if(!speechThread&&!wave){f.prefs.voiceModel=1-f.prefs.voiceModel;speechStatus=f.prefs.voiceModel?"SLT selected":"KAL selected";}else{changed=false;speechStatus="Wait for audio";}}
 #endif
                         else if(action=="pitch"){f.prefs.pitch=(f.prefs.pitch+1)%4;}
-                        else if(action=="voicetest"){if(!bot.active()&&!speechThread){closeAudio();pendingSpeech.clear();f.prefs.sound=2;startSpeech("Hello. I am Relay.",f.prefs.pitch,f.prefs.voiceModel);}else{changed=false;speechStatus="Wait for audio";}}
+                        else if(action=="voicetest"){if(!bot.active()&&!speechThread){closeAudio();pendingSpeech.clear();f.prefs.sound=2;startSpeech("Beep! Hello there! I am Relay. What shall we do today?",f.prefs.pitch,f.prefs.voiceModel);}else{changed=false;speechStatus="Wait for audio";}}
 #endif
                         else if(action=="clean"){f.prefs.clean=!f.prefs.clean;f.applyFullscreen();}
                         else if(action=="battery")f.prefs.battery=!f.prefs.battery;
