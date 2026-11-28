@@ -60,6 +60,14 @@ jobs:
           old="#ifdef _WIN32\n#define snprintf c99_snprintf"
           assert old in s
           p.write_text(s.replace(old,"#if defined(_WIN32) && !defined(UNDER_CE) && !defined(__MINGW32__)\n#define snprintf c99_snprintf",1))
+          # Match the public const-correct declaration in the legacy 2001 CE file backend.
+          p=Path("src/utils/cst_file_wince.c")
+          s=p.read_text()
+          old="int cst_fprintf(cst_file fh, char *fmt, ...)"
+          assert old in s
+          s=s.replace(old,"int cst_fprintf(cst_file fh, const char *fmt, ...)")
+          s=s.replace("count = vsprintf(outbuf,fmt,args); /* You use WinCE, you lose. */\n\tva_end(args);\n\treturn cst_fwrite(fh,outbuf,1,count);","count = vsnprintf(outbuf,sizeof(outbuf),fmt,args);\n\tva_end(args);\n\tif (count < 0 || count >= (int)sizeof(outbuf)) return -1;\n\treturn cst_fwrite(fh,outbuf,1,count);")
+          p.write_text(s)
           PY
           make -C src
           make -C lang/usenglish
