@@ -30,6 +30,9 @@ between("// RELAY native X11", "static int clamp", r'''// Generated from relay_f
 #ifdef RELAY_FLITE
 #include "flite.h"
 extern "C" cst_voice* register_cmu_us_kal(const char*);
+#ifdef RELAY_SLT
+extern "C" cst_voice* register_cmu_us_slt(const char*);
+#endif
 #endif
 static int64_t ms(){
     static DWORD prev=GetTickCount();static uint64_t ticks=0;
@@ -75,6 +78,11 @@ static WAVEHDR audioHeader={};
 static short samples[1600];
 #ifdef RELAY_FLITE
 static cst_voice* speechVoice=NULL;
+#ifdef RELAY_SLT
+static cst_voice* sltVoice=NULL;
+#endif
+static int speechModel=0;
+static bool fliteReady=false;
 static cst_wave* speechWave=NULL;
 static HANDLE speechThread=NULL;
 static std::string speechText;
@@ -87,13 +95,21 @@ static volatile LONG speechPhase=0;
 static std::vector<short> speechPCM;
 static DWORD WINAPI synthesize(LPVOID){
     InterlockedExchange(&speechPhase,1);
-    if(!speechVoice){flite_init();speechVoice=register_cmu_us_kal(NULL);}
-    if(!speechVoice){InterlockedExchange(&speechPhase,3);return 1;}
+    if(!fliteReady){flite_init();fliteReady=true;}
+    cst_voice* selected=NULL;
+#ifdef RELAY_SLT
+    if(speechModel==1){if(!sltVoice)sltVoice=register_cmu_us_slt(NULL);selected=sltVoice;}
+    else
+#endif
+    {if(!speechVoice)speechVoice=register_cmu_us_kal(NULL);selected=speechVoice;}
+    if(!selected){InterlockedExchange(&speechPhase,3);return 1;}
     InterlockedExchange(&speechPhase,2);
     // Flite KAL uses int_f0_target_mean/stddev in its native prosody model.
-    flite_feat_set_float(speechVoice->features,"int_f0_target_mean",(float)pitchHz[clamp(speechPitch,0,3)]);
-    flite_feat_set_float(speechVoice->features,"int_f0_target_stddev",speechPitch==0?11.0f:speechPitch==1?14.0f:speechPitch==2?7.0f:15.0f);
-    speechWave=flite_text_to_wave(speechText.c_str(),speechVoice);
+    if(speechModel==0){
+        flite_feat_set_float(selected->features,"int_f0_target_mean",(float)pitchHz[clamp(speechPitch,0,3)]);
+        flite_feat_set_float(selected->features,"int_f0_target_stddev",speechPitch==0?11.0f:speechPitch==1?14.0f:speechPitch==2?7.0f:15.0f);
+    }
+    speechWave=flite_text_to_wave(speechText.c_str(),selected);
     if(!speechWave||speechWave->num_samples<=0||speechWave->num_channels!=1||speechWave->sample_rate<=0)return 2;
     // Use the same 16 kHz mono PCM format already verified on the Sharp.
     int rate=speechWave->sample_rate,n=speechWave->num_samples;
@@ -108,9 +124,9 @@ static DWORD WINAPI synthesize(LPVOID){
     }
     return 0;
 }
-static void startSpeech(const std::string& text,int pitch){
+static void startSpeech(const std::string& text,int pitch,int model){
     if(speechThread||text.empty()||wave){speechStatus="Audio busy";return;}
-    speechText=text.substr(0,400);speechPitch=clamp(pitch,0,3);speechDiscard=false;speechPCM.clear();speechStatus="Voice loading";InterlockedExchange(&speechPhase,0);
+    speechText=text.substr(0,400);speechPitch=clamp(pitch,0,3);speechModel=clamp(model,0,1);speechDiscard=false;speechPCM.clear();speechStatus="Voice loading";InterlockedExchange(&speechPhase,0);
     speechThread=CreateThread(NULL,0,synthesize,NULL,0,NULL);
     if(!speechThread)speechStatus="Thread error";
 }
@@ -175,8 +191,13 @@ struct Preferences {
     int style=0,palette=1,effect=0,sleep=45,tracking=1,autoHinge=0,temp=65,clean=1,battery=0,pitch=1;
 #ifdef RELAY_FLITE
     int sound=2;
+#ifdef RELAY_SLT
+    int voiceModel=1;
 #else
-    int sound=0;
+    int voiceModel=0;
+#endif
+#else
+    int sound=0,voiceModel=0;
 #endif
     void load(){
         HANDLE h=CreateFileW(appPath(L"relay.conf").c_str(),GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
@@ -192,12 +213,15 @@ struct Preferences {
                 else if(k=="effect")effect=clamp(v,0,3);else if(k=="sleep")sleep=clamp(v,0,120);
                 else if(k=="tracking")tracking=v!=0;else if(k=="temp")temp=clamp(v,10,120);
                 else if(k=="sound")sound=validSound(v);else if(k=="clean")clean=v!=0;else if(k=="battery")battery=v!=0;else if(k=="pitch")pitch=clamp(v,0,3);
+#ifdef RELAY_SLT
+                else if(k=="voiceModel")voiceModel=clamp(v,0,1);
+#endif
             }
             p=e+1;
         }
     }
     bool save()const{
-        char data[256];int n=sprintf(data,"style %d\npalette %d\neffect %d\nsleep %d\ntracking %d\ntemp %d\nsound %d\nclean %d\nbattery %d\npitch %d\n",style,palette,effect,sleep,tracking,temp,sound,clean,battery,pitch);
+        char data[256];int n=sprintf(data,"style %d\npalette %d\neffect %d\nsleep %d\ntracking %d\ntemp %d\nsound %d\nclean %d\nbattery %d\npitch %d\nvoiceModel %d\n",style,palette,effect,sleep,tracking,temp,sound,clean,battery,pitch,voiceModel);
         std::wstring dest=appPath(L"relay.conf"),tmp=appPath(L"relay.conf.tmp"),backup=appPath(L"relay.conf.bak");
         HANDLE h=CreateFileW(tmp.c_str(),GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
         if(h==INVALID_HANDLE_VALUE)return false;
@@ -376,8 +400,11 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
 #endif
                         }
 #ifdef RELAY_FLITE
+#ifdef RELAY_SLT
+                        else if(action=="voiceModel"){if(!speechThread&&!wave){f.prefs.voiceModel=1-f.prefs.voiceModel;speechStatus=f.prefs.voiceModel?"SLT selected":"KAL selected";}else{changed=false;speechStatus="Wait for audio";}}
+#endif
                         else if(action=="pitch"){f.prefs.pitch=(f.prefs.pitch+1)%4;}
-                        else if(action=="voicetest"){if(!bot.active()&&!speechThread){closeAudio();pendingSpeech.clear();f.prefs.sound=2;startSpeech("Hello. I am Relay.",f.prefs.pitch);}else{changed=false;speechStatus="Wait for audio";}}
+                        else if(action=="voicetest"){if(!bot.active()&&!speechThread){closeAudio();pendingSpeech.clear();f.prefs.sound=2;startSpeech("Hello. I am Relay.",f.prefs.pitch,f.prefs.voiceModel);}else{changed=false;speechStatus="Wait for audio";}}
 #endif
                         else if(action=="clean"){f.prefs.clean=!f.prefs.clean;f.applyFullscreen();}
                         else if(action=="battery")f.prefs.battery=!f.prefs.battery;
@@ -451,7 +478,7 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
                 bot.completed=false;pendingSpeech=bot.reply;speechStatus="Reply queued";
             }else if(f.prefs.sound!=2){bot.completed=false;pendingSpeech.clear();}
             if(f.prefs.sound==2&&!bot.active()&&!speechThread&&!wave&&!pendingSpeech.empty()){
-                std::string say; say.swap(pendingSpeech);startSpeech(say,f.prefs.pitch);tonePlayed=true;
+                std::string say; say.swap(pendingSpeech);startSpeech(say,f.prefs.pitch,f.prefs.voiceModel);tonePlayed=true;
             }
 #endif
             if(!bot.active()&&moodUntil&&now>=moodUntil){mood=Neutral;moodUntil=0;}
@@ -469,7 +496,11 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
 '''
 # Voice test independent of the LLM, with diagnostics in the live settings preview.
 sub('row("Eye tracking",prefs.tracking?"On":"Off","tracking");',r'''#ifdef RELAY_FLITE
+#ifdef RELAY_SLT
+            keyRow(y,hh,{{prefs.tracking?"Track On":"Track Off","tracking"},{prefs.voiceModel?"SLT":"KAL","voiceModel"},{prefs.voiceModel?"Native":pitchName(prefs.pitch),prefs.voiceModel?"":"pitch"},{"Test voice","voicetest"}});y+=hh;
+#else
             keyRow(y,hh,{{prefs.tracking?"Track On":"Track Off","tracking"},{pitchName(prefs.pitch),"pitch"},{"Test voice","voicetest"}});y+=hh;
+#endif
             text(6,fontAscent+2,speechStatus,muted);
 #else
             row("Eye tracking",prefs.tracking?"On":"Off","tracking");
