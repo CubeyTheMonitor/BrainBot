@@ -1,0 +1,41 @@
+name: Build RELAY CE hardware test
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ce/**'
+      - '.github/workflows/build-ce.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned Brain Hackers CE compiler
+        run: |
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/cegcc.zip" https://github.com/brain-hackers/cegcc-build/releases/download/2026-04-14-154823/cegcc-x86_64-2026-04-14-154823.zip
+          mkdir -p "$RUNNER_TEMP/cegcc"
+          unzip -q "$RUNNER_TEMP/cegcc.zip" -d "$RUNNER_TEMP/cegcc"
+          chmod -R u+rx "$RUNNER_TEMP/cegcc"
+          compiler=$(find "$RUNNER_TEMP/cegcc" -name arm-mingw32ce-g++ | head -n 1)
+          test -n "$compiler"
+          dirname "$compiler" >> "$GITHUB_PATH"
+          "$compiler" --version
+      - name: Build Windows CE ARM926 application
+        run: |
+          mkdir -p 'package/アプリ/RELAY CE'
+          arm-mingw32ce-g++ -std=c++17 -Os -Wall -march=armv5tej -mcpu=arm926ej-s -static -s ce/main.cpp -o 'package/アプリ/RELAY CE/AppMain.exe' -lcoredll
+          file 'package/アプリ/RELAY CE/AppMain.exe'
+          arm-mingw32ce-objdump -p 'package/アプリ/RELAY CE/AppMain.exe' | head -n 90
+          touch 'package/アプリ/RELAY CE/index.din' 'package/アプリ/RELAY CE/AppMain.cfg'
+          cd package
+          zip -r ../relay-ce-hardware-test.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-ce-hardware-test
+          path: relay-ce-hardware-test.zip
+          if-no-files-found: error
