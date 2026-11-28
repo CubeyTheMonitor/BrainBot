@@ -1,0 +1,68 @@
+name: Build Mini vMac for Sharp
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'minivmac-ce/**'
+      - '.github/workflows/build-minivmac-ce.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [Plus, 128K]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Brain Hackers CE compiler
+        run: |
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/cegcc.zip" https://github.com/brain-hackers/cegcc-build/releases/download/2026-04-14-154823/cegcc-x86_64-2026-04-14-154823.zip
+          mkdir -p "$RUNNER_TEMP/cegcc"
+          unzip -q "$RUNNER_TEMP/cegcc.zip" -d "$RUNNER_TEMP/cegcc"
+          chmod -R u+rx "$RUNNER_TEMP/cegcc"
+          compiler=$(find "$RUNNER_TEMP/cegcc" -name arm-mingw32ce-gcc | head -n 1)
+          test -n "$compiler"
+          dirname "$compiler" >> "$GITHUB_PATH"
+      - name: Fetch upstream and patch Pocket PC backend
+        run: |
+          git clone https://github.com/minivmac/minivmac.git upstream
+          cd upstream
+          git checkout 6860a9a7f372c461b25dc42974b191a453ebcfb2
+          python3 ../minivmac-ce/patch.py
+      - name: Generate and cross compile
+        working-directory: upstream
+        run: |
+          ln -s src SRC
+          gcc -o setup_t setup/tool.c
+          ./setup_t -n minivmac-brain -e bgc -t wcar -m ${{ matrix.model }} -sound 0 -speed 1 -emm 0 -gkf 0 > setup.sh
+          bash -x setup.sh
+          ls -la
+          sed -i -e 's/\bgcc\.exe\b/arm-mingw32ce-gcc/g' -e 's/\bgcc\b/arm-mingw32ce-gcc/g' -e 's/arm-mingw32ce-arm-mingw32ce-gcc/arm-mingw32ce-gcc/g' -e 's/windres.exe/arm-mingw32ce-windres/g' -e 's/strip.exe/arm-mingw32ce-strip/g' -e 's/-laygshell//g' -e 's/-lmmtimer//g' Makefile 2>/dev/null || true
+          mf=$(find . -maxdepth 1 -iname makefile | head -n 1)
+          test -n "$mf"
+          sed -i -E 's/(^|[[:space:]])gcc(\.exe)?([[:space:]]|$)/\1arm-mingw32ce-gcc\3/g; s/windres\.exe/arm-mingw32ce-windres/g; s/strip\.exe/arm-mingw32ce-strip/g; s/-laygshell//g; s/-lmmtimer//g' "$mf"
+          cat "$mf"
+          make -f "$mf" -j2 CFLAGS="-std=gnu99 -DUNICODE -D_UNICODE -DUNDER_CE=1 -DMyTimeResolution=0 -march=armv5tej -mcpu=arm926ej-s -Wno-implicit-function-declaration -Wno-int-conversion" LDFLAGS="-static"
+      - name: Package Sharp application
+        run: |
+          exe=$(find upstream -type f -iname '*.exe' | head -n 1)
+          test -n "$exe"
+          file "$exe"
+          arm-mingw32ce-objdump -p "$exe" | head -n 100
+          dest="package/アプリ/Mini vMac ${{ matrix.model }}"
+          mkdir -p "$dest"
+          cp "$exe" "$dest/AppMain.exe"
+          touch "$dest/index.din" "$dest/AppMain.cfg"
+          cp upstream/COPYING.txt "$dest/COPYING.txt"
+          cp minivmac-ce/patch.py "$dest/"
+          printf '%s\n' 'Source: https://github.com/minivmac/minivmac/tree/6860a9a7f372c461b25dc42974b191a453ebcfb2' 'Sharp patch: https://github.com/CubeyTheMonitor/BrainBot/tree/main/minivmac-ce' > "$dest/SOURCE.txt"
+          cd package
+          zip -r ../minivmac-brain.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minivmac-brain-${{ matrix.model }}
+          path: minivmac-brain.zip
+          if-no-files-found: error
