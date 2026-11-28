@@ -4,6 +4,7 @@
 #include <X11/Xatom.h>
 #include <X11/keysym.h>
 #include <algorithm>
+#include <initializer_list>
 #include <chrono>
 #include <cerrno>
 #include <cstdio>
@@ -23,6 +24,37 @@
 using Clock=std::chrono::steady_clock;
 static int64_t ms(){return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();}
 static int clamp(int n,int lo,int hi){return std::max(lo,std::min(hi,n));}
+// Visual-only mood cues. These never select or modify the model's text.
+enum Mood {Neutral,Happy,Annoyed,Concerned,Curious};
+static std::string words(const std::string& text){
+    std::string out=" ";
+    for(unsigned char c:text){
+        if(c>='A'&&c<='Z')c+=32;
+        if((c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='\'')out+=char(c);
+        else if(out.back()!=' ')out+=' ';
+    }
+    if(out.back()!=' ')out+=' ';
+    return out;
+}
+static bool has(const std::string& s,std::initializer_list<const char*> phrases){
+    for(const char* p:phrases)if(s.find(std::string(" ")+p+" ")!=std::string::npos)return true;
+    return false;
+}
+static Mood userMood(const std::string& text){
+    auto s=words(text);
+    if(has(s,{"i'm sad","im sad","i am sad","i feel sad","i feel lonely","i'm upset","im upset","i am upset","i had a bad day","i feel terrible","i'm having a bad day"}))return Concerned;
+    if(has(s,{"you look stupid","you are stupid","you're stupid","youre stupid","you look ugly","you're ugly","you are ugly","you suck","you're annoying","you are annoying","shut up","i hate you","you're not cute","you are not cute","you look dumb","you idiot","you are useless","you're useless"}))return Annoyed;
+    if(has(s,{"you look cute","you're cute","youre cute","you are cute","so cute","you're adorable","you are adorable","you look adorable","you look nice","you look cool","you're cool","you are cool","good job","well done","i like you","i love you","you're my favorite","you are my favorite","thank you","thanks relay","thanks","i fixed you","you look good","you're awesome","you are awesome","you're amazing","you are amazing"})&&!has(s,{"not cute","not adorable","not cool","not good","don't like you","dont like you"}))return Happy;
+    if(has(s,{"what if","imagine if","did you know","have you ever"}))return Curious;
+    return Neutral;
+}
+static Mood replyMood(const std::string& text){
+    auto s=words(text);
+    if(has(s,{"that's rude","thats rude","how rude","not funny","leave me alone","i'm annoyed"}))return Annoyed;
+    if(has(s,{"i'm sorry to hear","sorry to hear","that sounds difficult","are you okay","what's wrong"}))return Concerned;
+    if(has(s,{"thank you","thanks","that's great","thats great","i'm happy","im happy","that's awesome","i appreciate it"}))return Happy;
+    return Neutral;
+}
 // Read switch states without grabbing the keyboard.
 struct Hinge {
     int fd=-1,tablet=-1,lid=-1;
@@ -395,7 +427,7 @@ struct Face {
         XSendEvent(d,DefaultRootWindow(d),False,SubstructureRedirectMask|SubstructureNotifyMask,&e);
         fullscreen=!fullscreen;
     }
-    void draw(int64_t now,int64_t last,int64_t touched,const Child& bot,const std::string& input,bool companion,bool typing,bool shift,bool symbols,bool forcedSleep,int gesture,bool hingeAvailable,bool settings,bool behavior){
+    void draw(int64_t now,int64_t last,int64_t touched,const Child& bot,const std::string& input,bool companion,bool typing,bool shift,bool symbols,bool forcedSleep,int gesture,bool hingeAvailable,bool settings,bool behavior,Mood mood){
         keys.clear();
         fg(black);XFillRectangle(d,pix,gc,0,0,w,h);
         if(!settings&&companion&&typing){keyboard(bot,input,shift,symbols);XCopyArea(d,pix,win,gc,0,0,w,h,0,0);XFlush(d);return;}
@@ -405,7 +437,10 @@ struct Face {
         layout(companion,showReply,settings);
         int eyeY=108;
         int phase=int(now%5200),blink=(phase>5000)?std::max(8,std::abs(phase-5100)*94/100):94;
-        int height=sleepy?23:react?(gesture==2?65:gesture==3?38:102):94;height=std::min(height,blink);
+        Mood expression=settings?Neutral:mood;
+        if(react&&gesture==2)expression=Happy;
+        if(react&&gesture==3)expression=Annoyed;
+        int height=sleepy?23:(react&&gesture==1)?102:expression==Happy?61:expression==Annoyed?34:expression==Concerned?55:94;
         int look=int((now/100)%80);look=(look<40?look:80-look)-20;
         Window root,child;int rx,ry,px,py;unsigned int mask;
         bool pointer=XQueryPointer(d,win,&root,&child,&rx,&ry,&px,&py,&mask);
@@ -417,13 +452,18 @@ struct Face {
                 tx=clamp((px-sx(x))*1024/std::max(1,scale)/5,-20,20);
                 ty=clamp((py-sy(eyeY))*1024/std::max(1,scale)/7,-9,9);
             }
-            if(react&&gesture==2){tx=0;ty=-5;}
+            if(expression==Happy){tx=0;ty=-5;}
+            if(expression==Annoyed){tx=(eye==0?7:-7);ty=0;}
+            if(expression==Concerned){tx=0;ty=5;}
+            if(expression==Curious){tx=8;ty=-3;}
             if(sleepy){tx=0;ty=0;}
             auto ease=[](int a,int b){int delta=b-a;return a+(delta==0?0:(delta>0?1:-1)*std::max(1,std::abs(delta)/3));};
             pupilX[eye]=ease(pupilX[eye],tx);pupilY[eye]=ease(pupilY[eye],ty);
-            int dx=pupilX[eye],dy=clamp(pupilY[eye],-height*12/100,height*12/100);
+            int eh=expression==Curious&&eye==1&&!sleepy?height*2/3:height;
+            eh=std::min(eh,blink);
+            int dx=pupilX[eye],dy=clamp(pupilY[eye],-eh*12/100,eh*12/100);
             eye++;
-            retroEye(x,eyeY,height,dx,dy);
+            retroEye(x,eyeY,eh,dx,dy);
         }
         int mouth=213;
         if(talking||thinking){
@@ -432,14 +472,19 @@ struct Face {
             for(int i=0;i<14;i++){
                 int k=(i+int(now/(talking?85:170)))%8;
                 static const int wave[]={0,1,2,1,0,-1,-2,-1};
-                int y=mouth+wave[k]*(talking?7:2);
+                int amplitude=expression==Annoyed?3:expression==Happy?7:talking?5:2;
+                int y=mouth+wave[k]*amplitude;
                 if(i==0)prev=mouth;
                 mouthLine(170+i*10,prev,170+i*10,y);
                 mouthLine(170+i*10,y,180+i*10,y);prev=y;
             }
             mouthLine(310,prev,310,mouth);
-        }else if(sleepy||(react&&gesture==3)){mouthLine(177,mouth,303,mouth);}
+        }else if(sleepy||expression==Annoyed){mouthLine(177,mouth,303,mouth);}
         else if(react&&gesture==1){rect(226,mouth-8,28,16,green);rect(230,mouth-4,20,8,black);}
+        else if(expression==Concerned){
+            mouthLine(195,mouth+7,195,mouth-4);mouthLine(195,mouth-4,285,mouth-4);mouthLine(285,mouth-4,285,mouth+7);
+        }else if(expression==Curious){mouthLine(220,mouth,260,mouth);}
+        else if(expression==Neutral){mouthLine(199,mouth,281,mouth);}
         else{
             // Square U-shaped smile rather than a rounded parenthesis.
             mouthLine(177,mouth-8,177,mouth+8);
@@ -478,7 +523,10 @@ struct Face {
     }
 };
 int main(int argc,char**argv){
-    if(argc>1&&std::string(argv[1])=="--self-test"){std::puts("RELAY X11 face executable OK");return 0;}
+    if(argc>1&&std::string(argv[1])=="--self-test"){
+        if(userMood("You look cute!")!=Happy||userMood("you look stupid")!=Annoyed||userMood("what do you look like?")!=Neutral||userMood("I am sad")!=Concerned||userMood("you are not cute")!=Annoyed||replyMood("Thank you!")!=Happy)return 2;
+        std::puts("RELAY X11 face and mood cue tests OK");return 0;
+    }
     Display* d=XOpenDisplay(nullptr);
     if(!d){std::fprintf(stderr,"RELAY face needs the Brainux X11 desktop. Use sh chat.sh for terminal mode.\n");return 1;}
     {
@@ -487,10 +535,11 @@ int main(int argc,char**argv){
         int seenTablet=-1,gesture=0,tapCount=0;
         int64_t pressAt=-1;int pressX=0,pressY=0;
         Atom close=XInternAtom(d,"WM_DELETE_WINDOW",False);XSetWMProtocols(d,f.win,&close,1);
-        int64_t last=ms(),touched=-10000,next=0;
+        int64_t last=ms(),touched=-10000,next=0,moodUntil=0;
+        Mood mood=Neutral, promptMood=Neutral;
         auto send=[&](){
             if(!bot.active()&&input.find_first_not_of(" \t\r\n")!=std::string::npos){
-                if(bot.start(input,f.prefs.temp)){input.clear();typing=false;shift=false;symbols=false;forcedSleep=false;}
+                if(bot.start(input,f.prefs.temp)){promptMood=mood=userMood(input);moodUntil=0;input.clear();typing=false;shift=false;symbols=false;forcedSleep=false;}
                 else bot.reply="Could not start model.";
                 last=ms();next=0;
             }
@@ -527,7 +576,7 @@ int main(int argc,char**argv){
                     else if(action=="symbols")symbols=!symbols;
                     else if(action=="delete"){if(!input.empty())input.pop_back();}
                     else if(action=="send")send();
-                    else if(action=="stop"){bot.stop();if(bot.reply.empty())bot.reply="Stopped."; }
+                    else if(action=="stop"){bot.stop();mood=promptMood=Neutral;moodUntil=0;if(bot.reply.empty())bot.reply="Stopped."; }
                     else if(action=="sleep")forcedSleep=!forcedSleep;
                     else if(action=="mode"){companion=!companion;typing=false;forcedSleep=false;}
                     else if(action=="exit")running=false;
@@ -557,11 +606,16 @@ int main(int argc,char**argv){
                     else for(int i=0;i<n&&input.size()<140;i++)if((unsigned char)b[i]>=32&&(unsigned char)b[i]<127){input+=b[i];if(!typing)companion=false;}
                 }
             }
-            bot.update();int64_t now=ms();
+            bool wasActive=bot.active();bot.update();int64_t now=ms();
+            if(wasActive&&!bot.active()){
+                if(promptMood==Neutral)mood=replyMood(bot.reply);
+                moodUntil=now+5000;last=now;
+            }else if(bot.active()&&bot.received&&promptMood==Neutral){mood=replyMood(bot.reply);}
+            if(!bot.active()&&moodUntil&&now>=moodUntil){mood=Neutral;moodUntil=0;}
             if(pressAt>=0&&now-pressAt>=350){gesture=2;touched=last=now;}
             hinge.update(now);
             if(f.prefs.autoHinge&&hinge.tablet>=0&&hinge.tablet!=seenTablet){seenTablet=hinge.tablet;companion=seenTablet==1;typing=false;forcedSleep=false;last=now;next=0;}
-            if(hinge.lid!=1&&now>=next){f.draw(now,last,touched,bot,input,companion,typing,shift,symbols,forcedSleep,gesture,hinge.fd>=0,settings,behavior);next=now+(bot.active()?100:typing?150:67);}
+            if(hinge.lid!=1&&now>=next){f.draw(now,last,touched,bot,input,companion,typing,shift,symbols,forcedSleep,gesture,hinge.fd>=0,settings,behavior,mood);next=now+(bot.active()?100:typing?150:67);}
             else if(hinge.lid==1)next=now+250;
             struct pollfd p[2]={{ConnectionNumber(d),POLLIN,0},{bot.fd,POLLIN,0}};
             poll(p,bot.active()?2:1,clamp(int(next-ms()),0,100));
