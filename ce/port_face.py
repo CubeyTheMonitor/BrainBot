@@ -87,7 +87,7 @@ static void quietTone(Mood mood){
 ''')
 between("struct Preferences", "struct Face", r'''
 struct Preferences {
-    int style=0,palette=1,effect=0,sleep=45,tracking=1,autoHinge=0,temp=65,sound=0;
+    int style=0,palette=1,effect=0,sleep=45,tracking=1,autoHinge=0,temp=65,sound=0,clean=1,battery=0;
     void load(){
         HANDLE h=CreateFileW(appPath(L"relay.conf").c_str(),GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
         if(h==INVALID_HANDLE_VALUE)return;
@@ -101,13 +101,13 @@ struct Preferences {
                 if(k=="style")style=clamp(v,0,4);else if(k=="palette")palette=clamp(v,0,5);
                 else if(k=="effect")effect=clamp(v,0,3);else if(k=="sleep")sleep=clamp(v,0,120);
                 else if(k=="tracking")tracking=v!=0;else if(k=="temp")temp=clamp(v,10,120);
-                else if(k=="sound")sound=v!=0;
+                else if(k=="sound")sound=v!=0;else if(k=="clean")clean=v!=0;else if(k=="battery")battery=v!=0;
             }
             p=e+1;
         }
     }
     bool save()const{
-        char data[256];int n=sprintf(data,"style %d\npalette %d\neffect %d\nsleep %d\ntracking %d\ntemp %d\nsound %d\n",style,palette,effect,sleep,tracking,temp,sound);
+        char data[256];int n=sprintf(data,"style %d\npalette %d\neffect %d\nsleep %d\ntracking %d\ntemp %d\nsound %d\nclean %d\nbattery %d\n",style,palette,effect,sleep,tracking,temp,sound,clean,battery);
         std::wstring dest=appPath(L"relay.conf"),tmp=appPath(L"relay.conf.tmp"),backup=appPath(L"relay.conf.bak");
         HANDLE h=CreateFileW(tmp.c_str(),GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
         if(h==INVALID_HANDLE_VALUE)return false;
@@ -120,6 +120,23 @@ struct Preferences {
         DeleteFileW(backup.c_str());return true;
     }
 };
+// Query only; never change the power manager or Sharp's battery process.
+static FARPROC powerLookup(FARPROC (WINAPI *fn)(HMODULE,LPCSTR),HMODULE h){return fn(h,"GetSystemPowerStatusEx2");}
+static FARPROC powerLookup(FARPROC (WINAPI *fn)(HMODULE,LPCWSTR),HMODULE h){return fn(h,L"GetSystemPowerStatusEx2");}
+static std::string batteryText(){
+    typedef DWORD (WINAPI *Query)(void*,DWORD,BOOL);
+    static Query query=(Query)powerLookup(&GetProcAddress,GetModuleHandle(L"coredll.dll"));
+    static int64_t next=-1;static std::string cached="BAT --";
+    int64_t now=ms();
+    if(now<next)return cached;next=now+10000;
+    union {DWORD align;BYTE b[128];} status={};
+    if(!query||query(status.b,sizeof(status.b),FALSE)<3){cached="BAT --";return cached;}
+    BYTE percent=status.b[2],flag=status.b[1];
+    if(percent>100)cached="BAT --";
+    else{char buf[24];sprintf(buf,"BAT %u%%",(unsigned)percent);cached=buf;}
+    if(flag!=255&&(flag&8))cached+=" +";
+    return cached;
+}
 static int stylusX=-1,stylusY=-1;
 static int64_t stylusMoved=-100000;
 struct NativeEvent{UINT type;int x,y;WPARAM key;};
@@ -127,6 +144,7 @@ static std::vector<NativeEvent> events;
 static LRESULT CALLBACK windowProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     int x=(short)LOWORD(lp),y=(short)HIWORD(lp);
     switch(msg){
+        case WM_ACTIVATE:events.push_back({msg,0,0,wp});return 0;
         case WM_CLOSE:events.push_back({msg,0,0,0});return 0;
         case WM_SIZE:events.push_back({msg,(int)LOWORD(lp),(int)HIWORD(lp),0});return 0;
         case WM_PAINT:{PAINTSTRUCT ps;BeginPaint(hwnd,&ps);EndPaint(hwnd,&ps);return 0;}
@@ -151,7 +169,7 @@ between("    Face(Display* display)", "    void applyPalette()", r'''    Face(HI
         if(!win)return;
         LOGFONT lf={};lf.lfHeight=-17;lf.lfWeight=FW_NORMAL;lf.lfPitchAndFamily=FIXED_PITCH|FF_MODERN;lstrcpy(lf.lfFaceName,L"Courier New");
         font=CreateFontIndirect(&lf);
-        prefs.load();applyPalette();ShowWindow(win,SW_SHOW);UpdateWindow(win);
+        prefs.load();applyPalette();ShowWindow(win,SW_SHOW);applyFullscreen();UpdateWindow(win);
         RECT r;GetClientRect(win,&r);resize(r.right,r.bottom);
     }
     ~Face(){freeBuffer();if(font)DeleteObject(font);if(win)DestroyWindow(win);}
@@ -181,6 +199,13 @@ between("    void fg(", "    void wrap(", r'''    void fg(unsigned long c){ink=(
         RECT r={x,y-fontAscent,w,std::max(y-fontAscent+fontH+2,y+2)};
         SetTextColor(pix,(COLORREF)c);SetBkMode(pix,TRANSPARENT);DrawText(pix,ws.c_str(),(int)ws.size(),&r,DT_LEFT|DT_SINGLELINE|DT_NOPREFIX);
     }
+    void applyFullscreen(){
+        if(!win)return;
+        // Change only RELAY's own Z order. Do not kill/hide any system window.
+        if(fullscreen&&prefs.clean){
+            SetWindowPos(win,HWND_TOPMOST,0,0,GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN),SWP_NOACTIVATE);
+        }else SetWindowPos(win,HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    }
     void present(){HDC dc=GetDC(win);if(dc){BitBlt(dc,0,0,w,h,pix,0,0,SRCCOPY);ReleaseDC(win,dc);}}
 ''')
 sub("            fg(outline);XSetLineAttributes(d,gc,1,LineSolid,CapButt,JoinMiter);\n            XDrawRectangle(d,pix,gc,x+1,y+1,ww-3,hh-3);",
@@ -193,8 +218,8 @@ between("            std::vector<XRectangle> dots;", "        }else if(prefs.sty
 ''')
 between("            std::vector<XSegment> lines;", "        }\n        if(prefs.effect&2)", "            for(int y=faceTop+4;y<faceBottom;y+=6)rawLine(0,y,w-1,y,scanColor);\n")
 sub("                fg(sweepColor);XFillRectangle(d,pix,gc,0,y,w,1);","                rawRect(0,y,w,1,sweepColor);")
-sub('row("Auto fold",prefs.autoHinge?"On":"Off","autohinge");','row("Reply tone",prefs.sound?"On":"Off","sound");')
-between("    void toggle(){","    void draw(",r'''    void toggle(){fullscreen=!fullscreen;ShowWindow(win,fullscreen?SW_MAXIMIZE:SW_RESTORE);}
+sub('row("Auto fold",prefs.autoHinge?"On":"Off","autohinge");','keyRow(y,hh,{{prefs.sound?"Tone On":"Tone Off","sound"},{prefs.clean?"Clean On":"Clean Off","clean"},{prefs.battery?"Batt On":"Batt Off","battery"}});y+=hh;')
+between("    void toggle(){","    void draw(",r'''    void toggle(){fullscreen=!fullscreen;ShowWindow(win,fullscreen?SW_MAXIMIZE:SW_RESTORE);applyFullscreen();}
 ''')
 sub("        keys.clear();\n        fg(black);XFillRectangle(d,pix,gc,0,0,w,h);","        if(!pix)return;keys.clear();rawRect(0,0,w,h,black);")
 s=s.replace("XCopyArea(d,pix,win,gc,0,0,w,h,0,0);XFlush(d);","present();")
@@ -233,6 +258,7 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
             for(const auto& e:events){
                 int64_t now=ms();
                 if(e.type==WM_CLOSE){running=false;break;}
+                if(e.type==WM_ACTIVATE){if(LOWORD(e.key)!=WA_INACTIVE)f.applyFullscreen();else SetWindowPos(f.win,HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);}
                 if(e.type==WM_SIZE&&e.x>0&&e.y>0&&(e.x!=f.w||e.y!=f.h))f.resize(e.x,e.y);
                 if(e.type==WM_LBUTTONDOWN||e.type==WM_MOUSEMOVE||e.type==WM_LBUTTONUP){
                     stylusX=e.x;stylusY=e.y;stylusMoved=now;
@@ -247,9 +273,11 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
                         else if(action=="effect")f.prefs.effect=(f.prefs.effect+1)%4;
                         else if(action=="tracking")f.prefs.tracking=!f.prefs.tracking;
                         else if(action=="sound"){f.prefs.sound=!f.prefs.sound;if(!f.prefs.sound)closeAudio();}
+                        else if(action=="clean"){f.prefs.clean=!f.prefs.clean;f.applyFullscreen();}
+                        else if(action=="battery")f.prefs.battery=!f.prefs.battery;
                         else if(action=="sleeptime"){int& t=f.prefs.sleep;t=t==0?15:t==15?45:t==45?120:0;}
                         else if(action=="temperature"){int& t=f.prefs.temp;t=t<40?40:t<65?65:t<85?85:t<100?100:20;}
-                        else if(action=="defaults"){f.prefs=Preferences{};f.applyPalette();closeAudio();}
+                        else if(action=="defaults"){f.prefs=Preferences{};f.applyPalette();f.applyFullscreen();closeAudio();}
                         else if(action=="save"){}
                         else if(action=="behavior"){behavior=true;changed=false;}
                         else if(action=="appearance"){behavior=false;changed=false;}
@@ -309,6 +337,9 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
     DeleteCriticalSection(&replyLock);return 0;
 }
 '''
+# Optional palette-matched battery text, in both modes. Unknown values stay unknown.
+sub('std::string state=thinking?"THINKING":talking?"TALKING":sleepy?"SLEEPY":hingeAvailable?"ONLINE":"MANUAL";','std::string state=thinking?"THINKING":talking?"TALKING":sleepy?"SLEEPY":"CE";if(prefs.battery)state=batteryText();')
+sub('        if(companion){\n            if(rows){','        if(companion){\n            if(prefs.battery){std::string b=batteryText();text(std::max(10,w-int(b.size())*fontW-8),fontAscent+2,b,muted);}\n            if(rows){')
 # Extend casual spelling without changing any LLM response.
 s=s.replace('"you look stupid","you are stupid"','"you look stupid","u look stupid","you are stupid"').replace('"you look cute","you\\x27re cute"','"you look cute","u look cute","you\\x27re cute"')
 s=s.replace("std::to_string(", "ceInt(")
