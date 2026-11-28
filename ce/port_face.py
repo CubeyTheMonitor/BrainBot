@@ -27,6 +27,10 @@ between("// RELAY native X11", "static int clamp", r'''// Generated from relay_f
 #include <vector>
 #include <wchar.h>
 #include "llm.h"
+#ifdef RELAY_FLITE
+#include "flite.h"
+extern "C" cst_voice* register_cmu_us_kal(const char*);
+#endif
 static int64_t ms(){
     static DWORD prev=GetTickCount();static uint64_t ticks=0;
     DWORD now=GetTickCount();ticks+=(DWORD)(now-prev);prev=now;return (int64_t)ticks;
@@ -69,8 +73,59 @@ struct Child {
 static HWAVEOUT wave=NULL;
 static WAVEHDR audioHeader={};
 static short samples[1600];
+#ifdef RELAY_FLITE
+static cst_voice* speechVoice=NULL;
+static cst_wave* speechWave=NULL;
+static HANDLE speechThread=NULL;
+static std::string speechText;
+static bool speechDiscard=false;
+static DWORD WINAPI synthesize(LPVOID){
+    if(!speechVoice){flite_init();speechVoice=register_cmu_us_kal(NULL);}
+    if(speechVoice)speechWave=flite_text_to_wave(speechText.c_str(),speechVoice);
+    return 0;
+}
+static void startSpeech(const std::string& text){
+    if(speechThread||text.empty()||wave)return;
+    speechText=text.substr(0,400);speechDiscard=false;
+    speechThread=CreateThread(NULL,0,synthesize,NULL,0,NULL);
+}
+#endif
 static void closeAudio(){
     if(wave){waveOutReset(wave);if(audioHeader.dwFlags&WHDR_PREPARED)waveOutUnprepareHeader(wave,&audioHeader,sizeof audioHeader);waveOutClose(wave);wave=NULL;}
+#ifdef RELAY_FLITE
+    if(speechThread)speechDiscard=true;
+    else if(speechWave){delete_wave(speechWave);speechWave=NULL;}
+#endif
+}
+#ifdef RELAY_FLITE
+static void updateSpeech(){
+    if(!speechThread||WaitForSingleObject(speechThread,0)!=WAIT_OBJECT_0)return;
+    CloseHandle(speechThread);speechThread=NULL;
+    if(speechDiscard||!speechWave||speechWave->num_samples<=0||speechWave->num_channels!=1){closeAudio();return;}
+    WAVEFORMATEX fmt={};fmt.wFormatTag=WAVE_FORMAT_PCM;fmt.nChannels=1;
+    fmt.nSamplesPerSec=speechWave->sample_rate;fmt.wBitsPerSample=16;fmt.nBlockAlign=2;fmt.nAvgBytesPerSec=fmt.nSamplesPerSec*2;
+    for(int i=0;i<speechWave->num_samples;i++)speechWave->samples[i]/=3;
+    if(waveOutOpen(&wave,WAVE_MAPPER,&fmt,0,0,CALLBACK_NULL)!=MMSYSERR_NOERROR){wave=NULL;closeAudio();return;}
+    ZeroMemory(&audioHeader,sizeof audioHeader);audioHeader.lpData=(LPSTR)speechWave->samples;audioHeader.dwBufferLength=speechWave->num_samples*2;
+    if(waveOutPrepareHeader(wave,&audioHeader,sizeof audioHeader)!=MMSYSERR_NOERROR||waveOutWrite(wave,&audioHeader,sizeof audioHeader)!=MMSYSERR_NOERROR)closeAudio();
+}
+static void finishSpeech(){if(speechThread){speechDiscard=true;WaitForSingleObject(speechThread,INFINITE);updateSpeech();}closeAudio();}
+static int nextSound(int n){return (n+1)%3;}
+#else
+static int nextSound(int n){return !n;}
+#endif
+static const char* soundName(int n){
+#ifdef RELAY_FLITE
+    if(n==2)return "Voice";
+#endif
+    return n?"Tone On":"Sound Off";
+}
+static int validSound(int n){
+#ifdef RELAY_FLITE
+    return clamp(n,0,2);
+#else
+    return n==1;
+#endif
 }
 static void quietTone(Mood mood){
     if(wave)return;
@@ -101,7 +156,7 @@ struct Preferences {
                 if(k=="style")style=clamp(v,0,4);else if(k=="palette")palette=clamp(v,0,5);
                 else if(k=="effect")effect=clamp(v,0,3);else if(k=="sleep")sleep=clamp(v,0,120);
                 else if(k=="tracking")tracking=v!=0;else if(k=="temp")temp=clamp(v,10,120);
-                else if(k=="sound")sound=v!=0;else if(k=="clean")clean=v!=0;else if(k=="battery")battery=v!=0;
+                else if(k=="sound")sound=validSound(v);else if(k=="clean")clean=v!=0;else if(k=="battery")battery=v!=0;
             }
             p=e+1;
         }
@@ -218,7 +273,7 @@ between("            std::vector<XRectangle> dots;", "        }else if(prefs.sty
 ''')
 between("            std::vector<XSegment> lines;", "        }\n        if(prefs.effect&2)", "            for(int y=faceTop+4;y<faceBottom;y+=6)rawLine(0,y,w-1,y,scanColor);\n")
 sub("                fg(sweepColor);XFillRectangle(d,pix,gc,0,y,w,1);","                rawRect(0,y,w,1,sweepColor);")
-sub('row("Auto fold",prefs.autoHinge?"On":"Off","autohinge");','keyRow(y,hh,{{prefs.sound?"Tone On":"Tone Off","sound"},{prefs.clean?"Clean On":"Clean Off","clean"},{prefs.battery?"Batt On":"Batt Off","battery"}});y+=hh;')
+sub('row("Auto fold",prefs.autoHinge?"On":"Off","autohinge");','keyRow(y,hh,{{soundName(prefs.sound),"sound"},{prefs.clean?"Clean On":"Clean Off","clean"},{prefs.battery?"Batt On":"Batt Off","battery"}});y+=hh;')
 between("    void toggle(){","    void draw(",r'''    void toggle(){fullscreen=!fullscreen;ShowWindow(win,fullscreen?SW_MAXIMIZE:SW_RESTORE);applyFullscreen();}
 ''')
 sub("        keys.clear();\n        fg(black);XFillRectangle(d,pix,gc,0,0,w,h);","        if(!pix)return;keys.clear();rawRect(0,0,w,h,black);")
@@ -248,14 +303,15 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
         Mood mood=Neutral,promptMood=Neutral;
         auto send=[&](){
             if(!bot.active()&&input.find_first_not_of(" \t\r\n")!=std::string::npos){
-                if(bot.start(input,f.prefs.temp)){promptMood=mood=userMood(input);moodUntil=0;input.clear();typing=shift=symbols=forcedSleep=false;gesture=0;touched=-10000;tonePlayed=false;}
+                if(bot.start(input,f.prefs.temp)){closeAudio();promptMood=mood=userMood(input);moodUntil=0;input.clear();typing=shift=symbols=forcedSleep=false;gesture=0;touched=-10000;tonePlayed=false;}
                 else bot.reply="Could not start model.";
                 last=ms();next=0;
             }
         };
         while(running){
             MSG m={};while(PeekMessage(&m,NULL,0,0,PM_REMOVE)){if(m.message==WM_QUIT){running=false;break;}TranslateMessage(&m);DispatchMessage(&m);}
-            for(const auto& e:events){
+            std::vector<NativeEvent> batch;batch.swap(events);
+            for(const auto& e:batch){
                 int64_t now=ms();
                 if(e.type==WM_CLOSE){running=false;break;}
                 if(e.type==WM_ACTIVATE){if(LOWORD(e.key)!=WA_INACTIVE)f.applyFullscreen();else SetWindowPos(f.win,HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);}
@@ -272,7 +328,7 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
                         else if(action=="palette"){f.prefs.palette=(f.prefs.palette+1)%6;f.applyPalette();}
                         else if(action=="effect")f.prefs.effect=(f.prefs.effect+1)%4;
                         else if(action=="tracking")f.prefs.tracking=!f.prefs.tracking;
-                        else if(action=="sound"){f.prefs.sound=!f.prefs.sound;if(!f.prefs.sound)closeAudio();}
+                        else if(action=="sound"){closeAudio();f.prefs.sound=nextSound(f.prefs.sound);}
                         else if(action=="clean"){f.prefs.clean=!f.prefs.clean;f.applyFullscreen();}
                         else if(action=="battery")f.prefs.battery=!f.prefs.battery;
                         else if(action=="sleeptime"){int& t=f.prefs.sleep;t=t==0?15:t==15?45:t==45?120:0;}
@@ -299,10 +355,10 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
                     next=0;
                 }
                 if(e.type==WM_MOUSEMOVE&&pressAt>=0){
-                    last=now;if(std::abs(e.x-pressX)+std::abs(e.y-pressY)>12){stroking=true;gesture=2;touched=now;next=0;}
+                    last=now;if(now-pressAt>=180&&std::abs(e.x-pressX)+std::abs(e.y-pressY)>=std::max(32,f.w/15)){stroking=true;gesture=2;touched=now;next=0;}
                 }
                 if(e.type==WM_LBUTTONUP&&pressAt>=0){
-                    bool pat=stroking||now-pressAt>=350||std::abs(e.x-pressX)+std::abs(e.y-pressY)>12;
+                    bool pat=stroking||now-pressAt>=650||(now-pressAt>=180&&std::abs(e.x-pressX)+std::abs(e.y-pressY)>=std::max(32,f.w/15));
                     if(pat){tapCount=0;gesture=2;}else{tapCount=now-lastPoke<900?tapCount+1:1;lastPoke=now;gesture=tapCount>=3?3:1;}
                     touched=last=now;pressAt=-1;next=0;
                 }
@@ -321,22 +377,30 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
                     next=0;
                 }
             }
-            events.clear();
             bool wasActive=bot.active();bot.update();int64_t now=ms();
             if(wasActive&&!bot.active()){if(promptMood==Neutral)mood=replyMood(bot.reply);moodUntil=now+5000;last=now;}
             else if(bot.active()&&bot.received&&promptMood==Neutral)mood=replyMood(bot.reply);
             if(wave&&(audioHeader.dwFlags&WHDR_DONE))closeAudio();
-            if(f.prefs.sound&&!tonePlayed&&bot.received){tonePlayed=true;quietTone(mood);}
+            if(f.prefs.sound==1&&!tonePlayed&&bot.received){tonePlayed=true;quietTone(mood);}
+#ifdef RELAY_FLITE
+            updateSpeech();
+            if(f.prefs.sound==2&&wasActive&&!bot.active()&&!tonePlayed&&!cancelled()&&bot.received){tonePlayed=true;startSpeech(bot.reply);}
+#endif
             if(!bot.active()&&moodUntil&&now>=moodUntil){mood=Neutral;moodUntil=0;}
-            if(pressAt>=0&&now-pressAt>=350){gesture=2;touched=last=now;}
+            if(pressAt>=0&&now-pressAt>=650){gesture=2;touched=last=now;}
             if(now>=next){f.draw(now,last,touched,bot,input,companion,typing,shift,symbols,forcedSleep,gesture,false,settings,behavior,mood);next=now+(bot.active()?100:typing?150:67);}
             Sleep((DWORD)clamp((int)(next-ms()),5,50));
         }
         closeAudio();bot.stop();
+#ifdef RELAY_FLITE
+        finishSpeech();
+#endif
     }
     DeleteCriticalSection(&replyLock);return 0;
 }
 '''
+# Animate the existing mouth waveform during native speech playback too.
+sub('talking=bot.active()&&bot.received;','talking=(bot.active()&&bot.received)||wave!=NULL;')
 # Optional palette-matched battery text, in both modes. Unknown values stay unknown.
 sub('std::string state=thinking?"THINKING":talking?"TALKING":sleepy?"SLEEPY":hingeAvailable?"ONLINE":"MANUAL";','std::string state=thinking?"THINKING":talking?"TALKING":sleepy?"SLEEPY":"CE";if(prefs.battery)state=batteryText();')
 sub('        if(companion){\n            if(rows){','        if(companion){\n            if(prefs.battery){std::string b=batteryText();text(std::max(10,w-int(b.size())*fontW-8),fontAscent+2,b,muted);}\n            if(rows){')

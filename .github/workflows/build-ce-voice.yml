@@ -1,0 +1,84 @@
+name: Build RELAY CE offline voice
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'relay_face.cpp'
+      - 'ce/chat.cpp'
+      - 'ce/port_face.py'
+      - 'ce/port_engine.py'
+      - '.github/workflows/build-ce-voice.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: therezor/cardputer-ai
+          ref: 78c5128672b750977619dc0a6c3b8baed91168ed
+          path: upstream
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: relay-armv5
+          repository: CubeyTheMonitor/BrainBot
+          run-id: 46103101586
+          github-token: ${{ github.token }}
+          path: weights
+      - uses: actions/checkout@v4
+        with:
+          repository: festvox/flite
+          ref: e9e2e37c329dbe98bfeb27a1828ef9a71fa84f88
+          path: flite
+          persist-credentials: false
+      - name: Install pinned CE compiler
+        run: |
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/cegcc.zip" https://github.com/brain-hackers/cegcc-build/releases/download/2026-04-14-154823/cegcc-x86_64-2026-04-14-154823.zip
+          unzip -q "$RUNNER_TEMP/cegcc.zip" -d "$RUNNER_TEMP/cegcc"
+          chmod -R u+rx "$RUNNER_TEMP/cegcc"
+          compiler=$(find "$RUNNER_TEMP/cegcc" -name arm-mingw32ce-g++ | head -n 1)
+          test -n "$compiler"
+          dirname "$compiler" >> "$GITHUB_PATH"
+      - name: Cross compile Flite 2.2 English voice
+        run: |
+          cd flite
+          # Flite's historic CE configure path expects this toolchain prefix.
+          sed -i 's|/opt/mingw32ce/bin/arm-wince-mingw32ce-|arm-mingw32ce-|g; s|/opt/mingw32ce/bin/arm-mingw32ce-|arm-mingw32ce-|g' configure
+          CFLAGS="-O2 -march=armv5tej -mcpu=arm926ej-s -DUNICODE -D_UNICODE" ./configure --target=arm-wince --with-audio=none --with-mmap=none
+          make -C src
+          make -C lang/usenglish
+          make -C lang/cmulex
+          make -C lang/cmu_us_kal
+          find build -name '*.a'
+      - name: Build native inference and GUI
+        run: |
+          mkdir -p port 'package/アプリ/RELAY CE Voice' extracted
+          tar -xzf weights/relay-armv5.tar.gz -C extracted
+          test "$(cat extracted/source-commit.txt)" = 78c5128672b750977619dc0a6c3b8baed91168ed
+          cp upstream/main/llm.h port/
+          python3 ce/port_engine.py upstream/main/llm.cpp port/llm.cpp
+          python3 ce/port_face.py relay_face.cpp ce/chat.cpp port/face.cpp
+          flite_lib=$(dirname "$(find flite/build -name libflite.a -print -quit)")
+          test -f "$flite_lib/libflite_cmu_us_kal.a"
+          arm-mingw32ce-g++ -std=c++17 -O2 -Wall -march=armv5tej -mcpu=arm926ej-s -static -s -DLLM_FORCE_SCALAR -DRELAY_FLITE -Iport -Iflite/include port/face.cpp port/llm.cpp -o 'package/アプリ/RELAY CE Voice/AppMain.exe' -L"$flite_lib" -lflite_cmu_us_kal -lflite_usenglish -lflite_cmulex -lflite -lcoredll
+          file 'package/アプリ/RELAY CE Voice/AppMain.exe'
+          arm-mingw32ce-objdump -p 'package/アプリ/RELAY CE Voice/AppMain.exe' > imports.txt
+          cat imports.txt
+          cp extracted/model_neo_q4.bin extracted/tok_neo.bin 'package/アプリ/RELAY CE Voice/'
+          for f in extracted/LICENSE* extracted/NOTICE*; do if [ -f "$f" ]; then cp "$f" 'package/アプリ/RELAY CE Voice/'; fi; done
+          cp flite/COPYING 'package/アプリ/RELAY CE Voice/LICENSE-Flite.txt'
+          touch 'package/アプリ/RELAY CE Voice/index.din' 'package/アプリ/RELAY CE Voice/AppMain.cfg'
+          cd package
+          zip -r ../relay-ce-voice.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-ce-voice
+          path: relay-ce-voice.zip
+          if-no-files-found: error
