@@ -52,6 +52,15 @@ jobs:
           # Flite's historic CE configure path expects this toolchain prefix.
           sed -i 's|/opt/mingw32ce/bin/arm-wince-mingw32ce-|arm-mingw32ce-|g; s|/opt/mingw32ce/bin/arm-mingw32ce-|arm-mingw32ce-|g' configure
           CC=arm-mingw32ce-gcc CFLAGS="-O2 -march=armv5tej -mcpu=arm926ej-s -DUNICODE -D_UNICODE" ./configure --build=x86_64-pc-linux-gnu --host=arm-wince --target=arm-wince --with-audio=none --with-mmap=none || { cat config.log; exit 1; }
+          # CeGCC provides snprintf; Flite's desktop MSVC shim uses unavailable secure CRT functions.
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("include/cst_file.h")
+          s=p.read_text()
+          old="#ifdef _WIN32\n#define snprintf c99_snprintf"
+          assert old in s
+          p.write_text(s.replace(old,"#if defined(_WIN32) && !defined(UNDER_CE) && !defined(__MINGW32__)\n#define snprintf c99_snprintf",1))
+          PY
           make -C src
           make -C lang/usenglish
           make -C lang/cmulex
