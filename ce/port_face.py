@@ -78,6 +78,9 @@ static cst_voice* speechVoice=NULL;
 static cst_wave* speechWave=NULL;
 static HANDLE speechThread=NULL;
 static std::string speechText;
+static int speechPitch=1;
+static const int pitchHz[]={95,145,175,205};
+static const char* pitchName(int n){const char* names[]={"Original","Light","Robot","High"};return names[clamp(n,0,3)];}
 static bool speechDiscard=false;
 static std::string speechStatus="Voice ready";
 static volatile LONG speechPhase=0;
@@ -87,6 +90,9 @@ static DWORD WINAPI synthesize(LPVOID){
     if(!speechVoice){flite_init();speechVoice=register_cmu_us_kal(NULL);}
     if(!speechVoice){InterlockedExchange(&speechPhase,3);return 1;}
     InterlockedExchange(&speechPhase,2);
+    // Flite KAL uses int_f0_target_mean/stddev in its native prosody model.
+    flite_feat_set_float(speechVoice->features,"int_f0_target_mean",(float)pitchHz[clamp(speechPitch,0,3)]);
+    flite_feat_set_float(speechVoice->features,"int_f0_target_stddev",speechPitch==0?11.0f:speechPitch==1?14.0f:speechPitch==2?7.0f:15.0f);
     speechWave=flite_text_to_wave(speechText.c_str(),speechVoice);
     if(!speechWave||speechWave->num_samples<=0||speechWave->num_channels!=1||speechWave->sample_rate<=0)return 2;
     // Use the same 16 kHz mono PCM format already verified on the Sharp.
@@ -102,9 +108,9 @@ static DWORD WINAPI synthesize(LPVOID){
     }
     return 0;
 }
-static void startSpeech(const std::string& text){
+static void startSpeech(const std::string& text,int pitch){
     if(speechThread||text.empty()||wave){speechStatus="Audio busy";return;}
-    speechText=text.substr(0,400);speechDiscard=false;speechPCM.clear();speechStatus="Voice loading";InterlockedExchange(&speechPhase,0);
+    speechText=text.substr(0,400);speechPitch=clamp(pitch,0,3);speechDiscard=false;speechPCM.clear();speechStatus="Voice loading";InterlockedExchange(&speechPhase,0);
     speechThread=CreateThread(NULL,0,synthesize,NULL,0,NULL);
     if(!speechThread)speechStatus="Thread error";
 }
@@ -166,7 +172,7 @@ static void quietTone(Mood mood){
 ''')
 between("struct Preferences", "struct Face", r'''
 struct Preferences {
-    int style=0,palette=1,effect=0,sleep=45,tracking=1,autoHinge=0,temp=65,clean=1,battery=0;
+    int style=0,palette=1,effect=0,sleep=45,tracking=1,autoHinge=0,temp=65,clean=1,battery=0,pitch=1;
 #ifdef RELAY_FLITE
     int sound=2;
 #else
@@ -185,13 +191,13 @@ struct Preferences {
                 if(k=="style")style=clamp(v,0,4);else if(k=="palette")palette=clamp(v,0,5);
                 else if(k=="effect")effect=clamp(v,0,3);else if(k=="sleep")sleep=clamp(v,0,120);
                 else if(k=="tracking")tracking=v!=0;else if(k=="temp")temp=clamp(v,10,120);
-                else if(k=="sound")sound=validSound(v);else if(k=="clean")clean=v!=0;else if(k=="battery")battery=v!=0;
+                else if(k=="sound")sound=validSound(v);else if(k=="clean")clean=v!=0;else if(k=="battery")battery=v!=0;else if(k=="pitch")pitch=clamp(v,0,3);
             }
             p=e+1;
         }
     }
     bool save()const{
-        char data[256];int n=sprintf(data,"style %d\npalette %d\neffect %d\nsleep %d\ntracking %d\ntemp %d\nsound %d\nclean %d\nbattery %d\n",style,palette,effect,sleep,tracking,temp,sound,clean,battery);
+        char data[256];int n=sprintf(data,"style %d\npalette %d\neffect %d\nsleep %d\ntracking %d\ntemp %d\nsound %d\nclean %d\nbattery %d\npitch %d\n",style,palette,effect,sleep,tracking,temp,sound,clean,battery,pitch);
         std::wstring dest=appPath(L"relay.conf"),tmp=appPath(L"relay.conf.tmp"),backup=appPath(L"relay.conf.bak");
         HANDLE h=CreateFileW(tmp.c_str(),GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
         if(h==INVALID_HANDLE_VALUE)return false;
@@ -370,7 +376,8 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
 #endif
                         }
 #ifdef RELAY_FLITE
-                        else if(action=="voicetest"){if(!bot.active()&&!speechThread){closeAudio();pendingSpeech.clear();f.prefs.sound=2;startSpeech("Hello. I am Relay.");}else{changed=false;speechStatus="Wait for audio";}}
+                        else if(action=="pitch"){f.prefs.pitch=(f.prefs.pitch+1)%4;}
+                        else if(action=="voicetest"){if(!bot.active()&&!speechThread){closeAudio();pendingSpeech.clear();f.prefs.sound=2;startSpeech("Hello. I am Relay.",f.prefs.pitch);}else{changed=false;speechStatus="Wait for audio";}}
 #endif
                         else if(action=="clean"){f.prefs.clean=!f.prefs.clean;f.applyFullscreen();}
                         else if(action=="battery")f.prefs.battery=!f.prefs.battery;
@@ -444,7 +451,7 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
                 bot.completed=false;pendingSpeech=bot.reply;speechStatus="Reply queued";
             }else if(f.prefs.sound!=2){bot.completed=false;pendingSpeech.clear();}
             if(f.prefs.sound==2&&!bot.active()&&!speechThread&&!wave&&!pendingSpeech.empty()){
-                std::string say; say.swap(pendingSpeech);startSpeech(say);tonePlayed=true;
+                std::string say; say.swap(pendingSpeech);startSpeech(say,f.prefs.pitch);tonePlayed=true;
             }
 #endif
             if(!bot.active()&&moodUntil&&now>=moodUntil){mood=Neutral;moodUntil=0;}
@@ -462,7 +469,7 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
 '''
 # Voice test independent of the LLM, with diagnostics in the live settings preview.
 sub('row("Eye tracking",prefs.tracking?"On":"Off","tracking");',r'''#ifdef RELAY_FLITE
-            keyRow(y,hh,{{prefs.tracking?"Track On":"Track Off","tracking"},{"Test voice","voicetest"}});y+=hh;
+            keyRow(y,hh,{{prefs.tracking?"Track On":"Track Off","tracking"},{pitchName(prefs.pitch),"pitch"},{"Test voice","voicetest"}});y+=hh;
             text(6,fontAscent+2,speechStatus,muted);
 #else
             row("Eye tracking",prefs.tracking?"On":"Off","tracking");
