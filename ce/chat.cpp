@@ -15,7 +15,10 @@
 #include <string>
 #include <vector>
 #include "llm.h"
-static DWORD started, touched, pressedAt;
+static DWORD started, touched, pressedAt, lastActivity, gestureAt, lastPoke, moodAt;
+static int downX,downY,pokeCount=0,gesture=0;
+static bool stroking=false,asleep=false,settings=false,tracking=true,scanlines=false;
+static int sleepSeconds=45;
 static bool pressed=false;
 static int pointerX=-1, pointerY=-1, lastKey=0, palette=0;
 static bool talking=false;
@@ -27,8 +30,8 @@ static RECT soundButton, colorButton, exitButton, sendButton, typeButton;
 static CRITICAL_SECTION replyLock;
 static HANDLE worker=NULL;
 static volatile LONG cancelWork=0;
-static bool closing=false,keyboard=false,shift=false,soundOn=true;
-static DWORD lastSound=0;
+static bool closing=false,keyboard=false,shift=false,soundOn=false;
+static bool replyTone=false;
 static std::string input,request,response;
 static int mood=0;
 static Transformer model={};
@@ -94,6 +97,7 @@ static DWORD WINAPI generate(LPVOID){
 static void send(){
     if(worker||input.find_first_not_of(' ')==std::string::npos)return;
     request=input;input.clear();keyboard=false;setResponse("");
+    gesture=0;pokeCount=0;asleep=false;lastActivity=GetTickCount();moodAt=lastActivity;replyTone=false;
     std::string lower=request;for(char& c:lower)if(c>='A'&&c<='Z')c+=32;
     mood=lower.find("you look stupid")!=std::string::npos||lower.find("you look ugly")!=std::string::npos?2:lower.find("you look cute")!=std::string::npos||lower.find("u look cute")!=std::string::npos||lower.find("good job")!=std::string::npos?1:0;
     InterlockedExchange(&cancelWork,0);
@@ -135,12 +139,13 @@ static void beep(int tone=0){
     if(waveOutOpen(&wave,WAVE_MAPPER,&fmt,0,0,CALLBACK_NULL)!=MMSYSERR_NOERROR){
         wave=NULL;audioStatus=TEXT("Audio open failed");return;
     }
-    for(int i=0;i<4000;i++){
-        int period=tone==2?(i<2000?65:81):tone==1?(i<2000?26:19):(i<2000?32:23);
-        int amp=min2(1800,min2(i*20,(3999-i)*20));
-        samples[i]=short((i%period<period/2)?amp:-amp);
+    for(int i=0;i<1600;i++){
+        int period=tone==2?(i<800?65:81):tone==1?(i<800?26:19):(i<800?32:23);
+        int amp=min2(550,min2(i*5,(1599-i)*5));
+        int phase=i%period;int triangle=phase<period/2?phase*4-period:3*period-phase*4;
+        samples[i]=short(amp*triangle/period);
     }
-    ZeroMemory(&header,sizeof(header));header.lpData=(LPSTR)samples;header.dwBufferLength=sizeof(samples);
+    ZeroMemory(&header,sizeof(header));header.lpData=(LPSTR)samples;header.dwBufferLength=1600*sizeof(short);
     if(waveOutPrepareHeader(wave,&header,sizeof(header))!=MMSYSERR_NOERROR ||
        waveOutWrite(wave,&header,sizeof(header))!=MMSYSERR_NOERROR){
         closeAudio();audioStatus=TEXT("Audio playback failed");return;
@@ -155,27 +160,32 @@ static void paint(HWND hwnd){
     HBITMAP bitmap=buffer?CreateCompatibleBitmap(screen,w,h):NULL;
     HGDIOBJ old=bitmap?SelectObject(buffer,bitmap):NULL;
     HDC dc=bitmap?buffer:screen;
-    COLORREF bg=palette?RGB(41,32,8):RGB(8,20,10);
-    COLORREF frame=palette?RGB(120,96,37):RGB(53,80,57);
-    COLORREF eye=palette?RGB(232,185,77):RGB(129,201,107);
+    const COLORREF backgrounds[]={RGB(8,20,10),RGB(41,32,8),RGB(174,183,155),RGB(6,18,32),RGB(30,5,5),RGB(14,14,14)};
+    const COLORREF frames[]={RGB(53,80,57),RGB(120,96,37),RGB(126,137,109),RGB(35,80,110),RGB(100,32,32),RGB(75,75,75)};
+    const COLORREF eyes[]={RGB(129,201,107),RGB(232,185,77),RGB(36,49,33),RGB(112,216,246),RGB(235,85,74),RGB(222,222,222)};
+    COLORREF bg=backgrounds[palette],frame=frames[palette],eye=eyes[palette];
     box(dc,0,0,w,h,bg);
     DWORD now=GetTickCount(),elapsed=now-started;
-    bool happy=(pressed&&now-pressedAt>250)||(now-touched<1000)||mood==1;
-    bool annoyed=mood==2&&!happy;
+    // A fresh tap or stroke replaces the previous gesture; idle pat cannot mask a poke.
+    int reaction=pressed?(stroking||now-pressedAt>=350?1:2):((now-gestureAt<1400)?gesture:0);
+    bool happy=reaction==1||(reaction==0&&mood==1);
+    bool annoyed=reaction==3||(reaction==0&&mood==2);
+    bool surprised=reaction==2;
+    if(asleep){happy=false;annoyed=false;surprised=false;}
     std::string reply=getResponse();
     int unit=max2(1,min2(w/13,(h-100)/6)),cy=h/2-15;
-    int eh=happy?unit:annoyed?max2(3,unit/2):unit*2;
-    if(elapsed%5000>4800)eh=max2(2,unit/4);
+    int eh=asleep?max2(2,unit/8):happy?unit:annoyed?max2(3,unit/2):surprised?unit*5/2:unit*2;
+    if(!asleep&&elapsed%5000>4800)eh=max2(2,unit/4);
     for(int i=0;i<2;i++){
         int x=w*(i?3:1)/4, y=cy-unit/2;
         box(dc,x-unit*3/2,y-unit*3/2,unit*3,unit*3,frame);
         box(dc,x-unit*3/2+3,y-unit*3/2+3,unit*3-6,unit*3-6,bg);
-        int dx=pointerX<0?0:clamp((pointerX-x)/12,-unit/3,unit/3);
-        int dy=pointerY<0?0:clamp((pointerY-y)/16,-unit/5,unit/5);
+        int dx=!tracking||asleep||pointerX<0?0:clamp((pointerX-x)/12,-unit/3,unit/3);
+        int dy=!tracking||asleep||pointerY<0?0:clamp((pointerY-y)/16,-unit/5,unit/5);
         box(dc,x-unit*3/4+dx,y-eh/2+dy,unit*3/2,eh,eye);
     }
     int my=cy+unit*3/2,th=max2(2,unit/9);
-    if(talking||(worker&&!reply.empty())){
+    if(!asleep&&(talking||(worker&&!reply.empty()))){
         for(int i=0;i<9;i++){
             int bar=th+int((elapsed/70+i*3)%5)*th;
             box(dc,w/2-unit*3/2+i*unit/3,my-bar/2,max2(2,unit/4),bar,eye);
@@ -183,9 +193,19 @@ static void paint(HWND hwnd){
     }else{
         box(dc,w/2-unit,my,unit*2,th,eye);
         if(happy){box(dc,w/2-unit,my-unit/3,th,unit/3,eye);box(dc,w/2+unit-th,my-unit/3,th,unit/3,eye);}
+        if(surprised){box(dc,w/2-th,my-th,th*2,th*3,eye);}
+        if(annoyed){box(dc,w/2-unit,my-th,th,th,eye);box(dc,w/2+unit-th,my-th,th,th,eye);}
     }
-    RECT title={0,2,w,25};label(dc,title,worker?TEXT("RELAY CE / THINKING"):TEXT("RELAY CE / V3"),eye);
-    if(keyboard){
+    if(scanlines)for(int y=28;y<h-104;y+=4)box(dc,0,y,w,1,bg);
+    RECT title={0,2,w,25};label(dc,title,settings?TEXT("RELAY CE / SETTINGS"):asleep?TEXT("RELAY CE / SLEEPING"):worker?TEXT("RELAY CE / THINKING"):TEXT("RELAY CE / V3   [Settings]"),eye);
+    if(settings){
+        box(dc,0,26,w,h-26,bg);
+        const LPCTSTR colors[]={TEXT("Green phosphor"),TEXT("Amber"),TEXT("Gray LCD"),TEXT("Blue VFD"),TEXT("Red LED"),TEXT("Mono CRT")};
+        LPCTSTR names[]={colors[palette],tracking?TEXT("Eye tracking: ON"):TEXT("Eye tracking: OFF"),scanlines?TEXT("Scanlines: ON"):TEXT("Scanlines: OFF"),soundOn?TEXT("Quiet reply tone: ON"):TEXT("Quiet reply tone: OFF"),TEXT(""),TEXT("Sleep now"),TEXT("Done")};
+        WCHAR sleepText[48];if(sleepSeconds)wsprintf(sleepText,TEXT("Auto sleep: %d seconds"),sleepSeconds);else lstrcpy(sleepText,TEXT("Auto sleep: OFF"));names[4]=sleepText;
+        int rh=max2(1,(h-30)/7);
+        for(int i=0;i<7;i++){RECT r={6,30+i*rh,w-6,30+(i+1)*rh};box(dc,r.left,r.top,r.right-r.left,r.bottom-r.top-2,frame);label(dc,r,names[i],eye);}
+    }else if(keyboard){
         box(dc,0,26,w,h-26,bg);
         RECT edit={8,26,w-8,55};std::wstring text=wide("> "+input+"_");label(dc,edit,text.c_str(),eye);
         const char* rows[]={"1234567890","qwertyuiop","asdfghjkl","zxcvbnm,.?"};
@@ -208,7 +228,7 @@ static void paint(HWND hwnd){
         DrawText(dc,shown.c_str(),-1,&edit,DT_LEFT|DT_SINGLELINE|DT_NOPREFIX);
         typeButton={0,h-32,w/5,h};sendButton={w/5,h-32,w*2/5,h};soundButton={w*2/5,h-32,w*3/5,h};colorButton={w*3/5,h-32,w*4/5,h};exitButton={w*4/5,h-32,w,h};
         RECT buttons[]={typeButton,sendButton,soundButton,colorButton,exitButton};
-        LPCTSTR names[]={TEXT("Type"),worker?TEXT("Stop"):TEXT("Send"),soundOn?TEXT("Sound ON"):TEXT("Sound OFF"),TEXT("Color"),TEXT("Exit")};
+        LPCTSTR names[]={TEXT("Type"),worker?TEXT("Stop"):TEXT("Send"),soundOn?TEXT("Sound ON"):TEXT("Sound OFF"),TEXT("Settings"),TEXT("Exit")};
         for(int i=0;i<5;i++){RECT r=buttons[i];box(dc,r.left+1,r.top+1,r.right-r.left-2,r.bottom-r.top-2,frame);label(dc,r,names[i],eye);}
     }
     if(bitmap){BitBlt(screen,0,0,w,h,buffer,0,0,SRCCOPY);SelectObject(buffer,old);DeleteObject(bitmap);}
@@ -218,20 +238,37 @@ static void paint(HWND hwnd){
 static LRESULT CALLBACK proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     int x=(short)LOWORD(lp),y=(short)HIWORD(lp);
     switch(msg){
-    case WM_CREATE:started=GetTickCount();touched=started-2000;SetTimer(hwnd,1,80,NULL);return 0;
+    case WM_CREATE:started=GetTickCount();lastActivity=started;touched=started-2000;gestureAt=started-2000;moodAt=started;SetTimer(hwnd,1,80,NULL);return 0;
     case WM_TIMER:
         if(wave&&(header.dwFlags&WHDR_DONE)){closeAudio();talking=false;}
         if(worker&&WaitForSingleObject(worker,0)==WAIT_OBJECT_0){
-            CloseHandle(worker);worker=NULL;touched=GetTickCount();
+            CloseHandle(worker);worker=NULL;lastActivity=GetTickCount();moodAt=lastActivity;
             if(closing){DestroyWindow(hwnd);return 0;}
         }
-        if(worker&&soundOn&&!wave&&!getResponse().empty()&&GetTickCount()-lastSound>850){lastSound=GetTickCount();beep(mood);}
-        if(!worker&&GetTickCount()-touched>6000)mood=0;
+        if(worker&&soundOn&&!replyTone&&!getResponse().empty()){replyTone=true;beep(mood);}
+        if(!worker&&GetTickCount()-moodAt>6000)mood=0;
+        if(!worker&&!pressed&&!keyboard&&!settings&&sleepSeconds&&GetTickCount()-lastActivity>(DWORD)sleepSeconds*1000)asleep=true;
         InvalidateRect(hwnd,NULL,FALSE);return 0;
     case WM_SIZE:InvalidateRect(hwnd,NULL,FALSE);return 0;
     case WM_PAINT:paint(hwnd);return 0;
     case WM_ERASEBKGND:return 1;
     case WM_LBUTTONDOWN:
+        lastActivity=GetTickCount();
+        if(asleep){asleep=false;return 0;}
+        if(settings){
+            RECT r;GetClientRect(hwnd,&r);int rh=max2(1,(r.bottom-30)/7);
+            if(y>=30)switch(clamp((y-30)/rh,0,6)){
+                case 0:palette=(palette+1)%6;break;
+                case 1:tracking=!tracking;break;
+                case 2:scanlines=!scanlines;break;
+                case 3:soundOn=!soundOn;if(!soundOn){closeAudio();talking=false;}break;
+                case 4:sleepSeconds=sleepSeconds==45?90:sleepSeconds==90?0:sleepSeconds==0?15:45;break;
+                case 5:settings=false;if(!worker)asleep=true;break;
+                case 6:settings=false;break;
+            }
+            return 0;
+        }
+        if(y<26&&!keyboard){settings=true;return 0;}
         if(keyboard){
             RECT r;GetClientRect(hwnd,&r);int w=max2(1,r.right),kh=max2(1,(r.bottom-60)/5);
             if(y>=60){
@@ -251,13 +288,25 @@ static LRESULT CALLBACK proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(in(exitButton,x,y)){requestClose(hwnd);return 0;}
         if(in(typeButton,x,y)){keyboard=true;return 0;}
         if(in(sendButton,x,y)){if(worker)InterlockedExchange(&cancelWork,1);else send();return 0;}
-        if(in(soundButton,x,y)){soundOn=!soundOn;if(soundOn)beep();else{closeAudio();talking=false;}return 0;}
-        if(in(colorButton,x,y)){palette=!palette;return 0;}
-        pressed=true;pressedAt=GetTickCount();pointerX=x;pointerY=y;SetCapture(hwnd);return 0;
-    case WM_MOUSEMOVE:if(pressed){pointerX=x;pointerY=y;}return 0;
-    case WM_LBUTTONUP:if(pressed){pressed=false;touched=GetTickCount();ReleaseCapture();}return 0;
-    case WM_KEYUP:if(wp==VK_ESCAPE){if(keyboard)keyboard=false;else requestClose(hwnd);return 0;}lastKey=(int)wp;return 0;
+        if(in(soundButton,x,y)){soundOn=!soundOn;if(!soundOn){closeAudio();talking=false;}return 0;}
+        if(in(colorButton,x,y)){settings=true;return 0;}
+        pressed=true;stroking=false;gesture=0;pressedAt=GetTickCount();downX=pointerX=x;downY=pointerY=y;SetCapture(hwnd);return 0;
+    case WM_MOUSEMOVE:
+        if(pressed){pointerX=x;pointerY=y;lastActivity=GetTickCount();if(abs(x-downX)+abs(y-downY)>14)stroking=true;}
+        return 0;
+    case WM_LBUTTONUP:
+        if(pressed){
+            DWORD now=GetTickCount();bool pat=stroking||now-pressedAt>=350;
+            pressed=false;lastActivity=gestureAt=now;
+            if(pat){gesture=1;pokeCount=0;}
+            else{pokeCount=now-lastPoke<1100?pokeCount+1:1;lastPoke=now;gesture=pokeCount>=3?3:2;}
+            ReleaseCapture();
+        }
+        return 0;
+    case WM_KEYUP:if(wp==VK_ESCAPE){if(settings)settings=false;else if(keyboard)keyboard=false;else requestClose(hwnd);return 0;}lastKey=(int)wp;return 0;
     case WM_CHAR:
+        lastActivity=GetTickCount();asleep=false;
+        if(settings)return 0;
         if(wp==13){send();return 0;}
         if(wp==8){if(!input.empty())input.pop_back();return 0;}
         if(wp>=32&&wp<127&&input.size()<100)input+=(char)wp;
