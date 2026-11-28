@@ -79,35 +79,59 @@ static cst_wave* speechWave=NULL;
 static HANDLE speechThread=NULL;
 static std::string speechText;
 static bool speechDiscard=false;
+static std::string speechStatus="Voice ready";
+static volatile LONG speechPhase=0;
+static std::vector<short> speechPCM;
 static DWORD WINAPI synthesize(LPVOID){
+    InterlockedExchange(&speechPhase,1);
     if(!speechVoice){flite_init();speechVoice=register_cmu_us_kal(NULL);}
-    if(speechVoice)speechWave=flite_text_to_wave(speechText.c_str(),speechVoice);
+    if(!speechVoice){InterlockedExchange(&speechPhase,3);return 1;}
+    InterlockedExchange(&speechPhase,2);
+    speechWave=flite_text_to_wave(speechText.c_str(),speechVoice);
+    if(!speechWave||speechWave->num_samples<=0||speechWave->num_channels!=1||speechWave->sample_rate<=0)return 2;
+    // Use the same 16 kHz mono PCM format already verified on the Sharp.
+    int rate=speechWave->sample_rate,n=speechWave->num_samples;
+    int count=(int)((int64_t)n*16000/rate);
+    if(count<=0||count>16000*120)return 3;
+    try{speechPCM.resize(count);}catch(...){return 4;}
+    for(int i=0;i<count;i++){
+        int64_t pos=(int64_t)i*rate;int a=(int)(pos/16000),frac=(int)(pos%16000);
+        int b=std::min(a+1,n-1);a=std::min(a,n-1);
+        int v=(speechWave->samples[a]*(16000-frac)+speechWave->samples[b]*frac)/16000;
+        speechPCM[i]=(short)clamp(v,-24000,24000);
+    }
     return 0;
 }
 static void startSpeech(const std::string& text){
-    if(speechThread||text.empty()||wave)return;
-    speechText=text.substr(0,400);speechDiscard=false;
+    if(speechThread||text.empty()||wave){speechStatus="Audio busy";return;}
+    speechText=text.substr(0,400);speechDiscard=false;speechPCM.clear();speechStatus="Voice loading";InterlockedExchange(&speechPhase,0);
     speechThread=CreateThread(NULL,0,synthesize,NULL,0,NULL);
+    if(!speechThread)speechStatus="Thread error";
 }
 #endif
 static void closeAudio(){
     if(wave){waveOutReset(wave);if(audioHeader.dwFlags&WHDR_PREPARED)waveOutUnprepareHeader(wave,&audioHeader,sizeof audioHeader);waveOutClose(wave);wave=NULL;}
 #ifdef RELAY_FLITE
     if(speechThread)speechDiscard=true;
-    else if(speechWave){delete_wave(speechWave);speechWave=NULL;}
+    else {if(speechWave){delete_wave(speechWave);speechWave=NULL;}speechPCM.clear();}
 #endif
 }
 #ifdef RELAY_FLITE
 static void updateSpeech(){
-    if(!speechThread||WaitForSingleObject(speechThread,0)!=WAIT_OBJECT_0)return;
-    CloseHandle(speechThread);speechThread=NULL;
-    if(speechDiscard||!speechWave||speechWave->num_samples<=0||speechWave->num_channels!=1){closeAudio();return;}
+    if(!speechThread)return;
+    if(WaitForSingleObject(speechThread,0)!=WAIT_OBJECT_0){speechStatus=InterlockedCompareExchange(&speechPhase,0,0)==2?"Synthesizing":"Voice loading";return;}
+    DWORD code=99;GetExitCodeThread(speechThread,&code);CloseHandle(speechThread);speechThread=NULL;
+    if(speechDiscard){closeAudio();speechStatus="Voice stopped";return;}
+    if(code||speechPCM.empty()){char b[32];sprintf(b,"Synth error %lu",(unsigned long)code);speechStatus=b;closeAudio();return;}
     WAVEFORMATEX fmt={};fmt.wFormatTag=WAVE_FORMAT_PCM;fmt.nChannels=1;
-    fmt.nSamplesPerSec=speechWave->sample_rate;fmt.wBitsPerSample=16;fmt.nBlockAlign=2;fmt.nAvgBytesPerSec=fmt.nSamplesPerSec*2;
-    for(int i=0;i<speechWave->num_samples;i++)speechWave->samples[i]/=3;
-    if(waveOutOpen(&wave,WAVE_MAPPER,&fmt,0,0,CALLBACK_NULL)!=MMSYSERR_NOERROR){wave=NULL;closeAudio();return;}
-    ZeroMemory(&audioHeader,sizeof audioHeader);audioHeader.lpData=(LPSTR)speechWave->samples;audioHeader.dwBufferLength=speechWave->num_samples*2;
-    if(waveOutPrepareHeader(wave,&audioHeader,sizeof audioHeader)!=MMSYSERR_NOERROR||waveOutWrite(wave,&audioHeader,sizeof audioHeader)!=MMSYSERR_NOERROR)closeAudio();
+    fmt.nSamplesPerSec=16000;fmt.wBitsPerSample=16;fmt.nBlockAlign=2;fmt.nAvgBytesPerSec=32000;
+    MMRESULT rc=waveOutOpen(&wave,WAVE_MAPPER,&fmt,0,0,CALLBACK_NULL);
+    if(rc!=MMSYSERR_NOERROR){char b[32];sprintf(b,"Open error %u",(unsigned)rc);speechStatus=b;wave=NULL;closeAudio();return;}
+    ZeroMemory(&audioHeader,sizeof audioHeader);audioHeader.lpData=(LPSTR)speechPCM.data();audioHeader.dwBufferLength=speechPCM.size()*2;
+    rc=waveOutPrepareHeader(wave,&audioHeader,sizeof audioHeader);
+    if(rc==MMSYSERR_NOERROR)rc=waveOutWrite(wave,&audioHeader,sizeof audioHeader);
+    if(rc!=MMSYSERR_NOERROR){char b[32];sprintf(b,"Play error %u",(unsigned)rc);speechStatus=b;closeAudio();return;}
+    speechStatus="Speaking";
 }
 static void finishSpeech(){if(speechThread){speechDiscard=true;WaitForSingleObject(speechThread,INFINITE);updateSpeech();}closeAudio();}
 static int nextSound(int n){return (n+1)%3;}
@@ -329,6 +353,9 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
                         else if(action=="effect")f.prefs.effect=(f.prefs.effect+1)%4;
                         else if(action=="tracking")f.prefs.tracking=!f.prefs.tracking;
                         else if(action=="sound"){closeAudio();f.prefs.sound=nextSound(f.prefs.sound);}
+#ifdef RELAY_FLITE
+                        else if(action=="voicetest"){changed=false;if(!bot.active()){closeAudio();startSpeech("Hello. I am Relay.");}else speechStatus="Wait for reply";}
+#endif
                         else if(action=="clean"){f.prefs.clean=!f.prefs.clean;f.applyFullscreen();}
                         else if(action=="battery")f.prefs.battery=!f.prefs.battery;
                         else if(action=="sleeptime"){int& t=f.prefs.sleep;t=t==0?15:t==15?45:t==45?120:0;}
@@ -380,7 +407,12 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
             bool wasActive=bot.active();bot.update();int64_t now=ms();
             if(wasActive&&!bot.active()){if(promptMood==Neutral)mood=replyMood(bot.reply);moodUntil=now+5000;last=now;}
             else if(bot.active()&&bot.received&&promptMood==Neutral)mood=replyMood(bot.reply);
-            if(wave&&(audioHeader.dwFlags&WHDR_DONE))closeAudio();
+            if(wave&&(audioHeader.dwFlags&WHDR_DONE)){
+#ifdef RELAY_FLITE
+                if(!speechPCM.empty())speechStatus="Voice finished";
+#endif
+                closeAudio();
+            }
             if(f.prefs.sound==1&&!tonePlayed&&bot.received){tonePlayed=true;quietTone(mood);}
 #ifdef RELAY_FLITE
             updateSpeech();
@@ -399,6 +431,13 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
     DeleteCriticalSection(&replyLock);return 0;
 }
 '''
+# Voice test independent of the LLM, with diagnostics in the live settings preview.
+sub('row("Eye tracking",prefs.tracking?"On":"Off","tracking");',r'''#ifdef RELAY_FLITE
+            keyRow(y,hh,{{prefs.tracking?"Track On":"Track Off","tracking"},{"Test voice","voicetest"}});y+=hh;
+            text(6,fontAscent+2,speechStatus,muted);
+#else
+            row("Eye tracking",prefs.tracking?"On":"Off","tracking");
+#endif''')
 # Animate the existing mouth waveform during native speech playback too.
 sub('talking=bot.active()&&bot.received;','talking=(bot.active()&&bot.received)||wave!=NULL;')
 # Optional palette-matched battery text, in both modes. Unknown values stay unknown.
