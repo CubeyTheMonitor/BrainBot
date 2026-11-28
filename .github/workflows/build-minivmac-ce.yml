@@ -40,15 +40,25 @@ jobs:
           ./setup_t -n minivmac-brain -e bgc -t wcar -m ${{ matrix.model }} -sound 0 -speed 1 -emm 0 -gkf 0 > setup.sh
           bash -x setup.sh
           ls -la
-          sed -i -e 's/\bgcc\.exe\b/arm-mingw32ce-gcc/g' -e 's/\bgcc\b/arm-mingw32ce-gcc/g' -e 's/arm-mingw32ce-arm-mingw32ce-gcc/arm-mingw32ce-gcc/g' -e 's/windres.exe/arm-mingw32ce-windres/g' -e 's/strip.exe/arm-mingw32ce-strip/g' -e 's/-laygshell//g' -e 's/-lmmtimer//g' Makefile 2>/dev/null || true
           mf=$(find . -maxdepth 1 -iname makefile | head -n 1)
           test -n "$mf"
-          sed -i -E 's/(^|[[:space:]])gcc(\.exe)?([[:space:]]|$)/\1arm-mingw32ce-gcc\3/g; s/windres\.exe/arm-mingw32ce-windres/g; s/strip\.exe/arm-mingw32ce-strip/g; s/-laygshell//g; s/-lmmtimer//g' "$mf"
+          python3 - "$mf" <<'PY'
+          from pathlib import Path
+          import re, sys
+          p = Path(sys.argv[1])
+          s = p.read_text()
+          s = re.sub(r'(?<![\w-])gcc(?:\.exe)?\b', 'arm-mingw32ce-gcc', s)
+          s = s.replace('windres.exe','arm-mingw32ce-windres').replace('strip.exe','arm-mingw32ce-strip')
+          s = s.replace('-laygshell','').replace('-lmmtimer','')
+          s = s.replace('cfg/main.r"', 'cfg/main.rc"').replace('cfg/main.r\n','cfg/main.rc\n')
+          s = s.replace('bld/:', 'bld/mainres.o:').replace(' "bld/"',' "bld/mainres.o"').replace('$(ObjFiles) bld/\n','$(ObjFiles) bld/mainres.o\n')
+          p.write_text(s)
+          PY
           cat "$mf"
-          make -f "$mf" -j2 CFLAGS="-std=gnu99 -DUNICODE -D_UNICODE -DUNDER_CE=1 -DMyTimeResolution=0 -march=armv5tej -mcpu=arm926ej-s -Wno-implicit-function-declaration -Wno-int-conversion" LDFLAGS="-static"
+          make -f "$mf" -j2 CFLAGS="-std=gnu99 -DUNICODE -D_UNICODE -DUNDER_CE=1 -D_tWinMain=WinMain -DMyTimeResolution=0 -march=armv5tej -mcpu=arm926ej-s -Wno-implicit-function-declaration -Wno-int-conversion" LDFLAGS="-static"
       - name: Package Sharp application
         run: |
-          exe=$(find upstream -type f -iname '*.exe' | head -n 1)
+          exe=upstream/minivmac.exe
           test -n "$exe"
           file "$exe"
           arm-mingw32ce-objdump -p "$exe" | head -n 100
