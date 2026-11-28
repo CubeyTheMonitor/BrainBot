@@ -26,5 +26,7 @@ s=s[:a]+"""static long relay_round(float x) {
 """+s[a:]
 for old,new in {"lrintf(":"relay_round(","fabsf(":"fabs(","sqrtf(":"sqrt(","tanhf(":"tanh(","expf(":"exp(","powf(":"pow(","cosf(":"cos(","sinf(":"sin("}.items():
     s=s.replace(old,new)
-assert "xSemaphore" not in s and "heap_caps" not in s
+# WinCE schedules the inference worker preemptively; no FreeRTOS yield is needed.
+s=s.replace("taskYIELD();", "(void)0;")
+assert "xSemaphore" not in s and "heap_caps" not in s and "taskYIELD" not in s
 Path(sys.argv[2]).write_text(s)
