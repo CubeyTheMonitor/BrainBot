@@ -179,11 +179,12 @@ struct Face {
     int sy(int y)const{return offsetY+dim(y);}
     int rowHeight()const{return fontH+3;}
     int toolbarHeight()const{return std::max(32,fontH+12);}
-    void layout(bool companion){
+    int companionReplyRows()const{return h>=350?4:3;}
+    void layout(bool companion,bool showReply){
         int top=companion?0:rowHeight()+4;
         int footer=companion?0:rowHeight()+8;
         int replyRows=h>=350?3:2;
-        int bottom=companion?std::max(1,h-toolbarHeight()):std::max(top+1,h-footer-replyRows*rowHeight()-8);
+        int bottom=companion?std::max(1,h-toolbarHeight()-(showReply?companionReplyRows()*rowHeight()+8:0)):std::max(top+1,h-footer-replyRows*rowHeight()-8);
         // Preserve the original shape proportions and center the complete
         // face (eye housing + mouth) in the area above the chat.
         scale=std::max(1,std::min(w*1024/480,(bottom-top)*1024/184));
@@ -276,7 +277,8 @@ struct Face {
         if(companion&&typing){keyboard(bot,input,shift,symbols);XCopyArea(d,pix,win,gc,0,0,w,h,0,0);XFlush(d);return;}
         bool thinking=bot.active()&&!bot.received,talking=bot.active()&&bot.received;
         bool sleepy=!bot.active()&&(forcedSleep||now-last>45000),react=now-touched<850;
-        layout(companion);
+        bool showReply=bot.active()||!bot.reply.empty();
+        layout(companion,showReply);
         int eyeY=108;
         int phase=int(now%5200),blink=(phase>5000)?std::max(8,std::abs(phase-5100)*94/100):94;
         int height=sleepy?23:react?(gesture==2?65:gesture==3?38:102):94;height=std::min(height,blink);
@@ -341,7 +343,14 @@ struct Face {
             text(10,h-6-(fontH-fontAscent),"> "+shown+(bot.active()?"":"_"),green);
         }
         if(companion){
-            keyRow(h-toolbarHeight(),toolbarHeight(),{{"Type","type"},{forcedSleep?"Wake":"Sleep","sleep"},{"Chat","mode"},{"Exit","exit"}});
+            if(showReply){
+                int rows=companionReplyRows();
+                int top=h-toolbarHeight()-rows*rowHeight()-8;
+                fg(outline);XSetLineAttributes(d,gc,1,LineSolid,CapButt,JoinMiter);
+                XDrawLine(d,pix,gc,8,top,w-8,top);
+                wrap(bot.reply.empty()?"Thinking...":bot.reply,top+4+fontAscent,rows);
+            }
+            keyRow(h-toolbarHeight(),toolbarHeight(),{{"Type","type"},{bot.active()?"Stop":forcedSleep?"Wake":"Sleep",bot.active()?"stop":"sleep"},{"Chat","mode"},{"Exit","exit"}});
         }
         XCopyArea(d,pix,win,gc,0,0,w,h,0,0);XFlush(d);
     }
@@ -357,7 +366,13 @@ int main(int argc,char**argv){
         int64_t pressAt=-1;int pressX=0,pressY=0;
         Atom close=XInternAtom(d,"WM_DELETE_WINDOW",False);XSetWMProtocols(d,f.win,&close,1);
         int64_t last=ms(),touched=-10000,next=0;
-        auto send=[&](){if(!bot.active()&&!input.empty()){if(bot.start(input))input.clear();else bot.reply="Could not start model.";}};
+        auto send=[&](){
+            if(!bot.active()&&input.find_first_not_of(" \t\r\n")!=std::string::npos){
+                if(bot.start(input)){input.clear();typing=false;shift=false;symbols=false;forcedSleep=false;}
+                else bot.reply="Could not start model.";
+                last=ms();next=0;
+            }
+        };
         while(running){
             while(XPending(d)){
                 XEvent e;XNextEvent(d,&e);
@@ -373,7 +388,7 @@ int main(int argc,char**argv){
                     else if(action=="symbols")symbols=!symbols;
                     else if(action=="delete"){if(!input.empty())input.pop_back();}
                     else if(action=="send")send();
-                    else if(action=="stop")bot.stop();
+                    else if(action=="stop"){bot.stop();if(bot.reply.empty())bot.reply="Stopped."; }
                     else if(action=="sleep")forcedSleep=!forcedSleep;
                     else if(action=="mode"){companion=!companion;typing=false;forcedSleep=false;}
                     else if(action=="exit")running=false;
