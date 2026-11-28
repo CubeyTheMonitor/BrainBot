@@ -1,0 +1,61 @@
+name: Build RELAY CE V3 chat
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ce/chat.cpp'
+      - 'ce/port_engine.py'
+      - '.github/workflows/build-ce-chat.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: therezor/cardputer-ai
+          ref: 78c5128672b750977619dc0a6c3b8baed91168ed
+          path: upstream
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: relay-armv5
+          repository: CubeyTheMonitor/BrainBot
+          run-id: 46103101586
+          github-token: ${{ github.token }}
+          path: weights
+      - name: Install pinned CE compiler
+        run: |
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/cegcc.zip" https://github.com/brain-hackers/cegcc-build/releases/download/2026-04-14-154823/cegcc-x86_64-2026-04-14-154823.zip
+          unzip -q "$RUNNER_TEMP/cegcc.zip" -d "$RUNNER_TEMP/cegcc"
+          chmod -R u+rx "$RUNNER_TEMP/cegcc"
+          compiler=$(find "$RUNNER_TEMP/cegcc" -name arm-mingw32ce-g++ | head -n 1)
+          test -n "$compiler"
+          dirname "$compiler" >> "$GITHUB_PATH"
+      - name: Build native inference and GUI
+        run: |
+          mkdir -p port 'package/アプリ/RELAY CE V3' extracted
+          tar -xzf weights/relay-armv5.tar.gz -C extracted
+          test "$(cat extracted/source-commit.txt)" = 78c5128672b750977619dc0a6c3b8baed91168ed
+          cp upstream/main/llm.h port/
+          python3 ce/port_engine.py upstream/main/llm.cpp port/llm.cpp
+          arm-mingw32ce-g++ -std=c++17 -O2 -Wall -march=armv5tej -mcpu=arm926ej-s -static -s -DLLM_FORCE_SCALAR -Iport ce/chat.cpp port/llm.cpp -o 'package/アプリ/RELAY CE V3/AppMain.exe' -lcoredll
+          file 'package/アプリ/RELAY CE V3/AppMain.exe'
+          arm-mingw32ce-objdump -p 'package/アプリ/RELAY CE V3/AppMain.exe' > imports.txt
+          cat imports.txt
+          cp extracted/model_neo_q4.bin extracted/tok_neo.bin 'package/アプリ/RELAY CE V3/'
+          for f in extracted/LICENSE* extracted/NOTICE*; do if [ -f "$f" ]; then cp "$f" 'package/アプリ/RELAY CE V3/'; fi; done
+          touch 'package/アプリ/RELAY CE V3/index.din' 'package/アプリ/RELAY CE V3/AppMain.cfg'
+          cd package
+          zip -r ../relay-ce-v3.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-ce-v3
+          path: relay-ce-v3.zip
+          if-no-files-found: error
