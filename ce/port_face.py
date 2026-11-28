@@ -51,12 +51,12 @@ static int modelTemp=65;
 static std::string request,response;
 '''+engine+r'''
 struct Child {
-    HANDLE thread=NULL;bool received=false;std::string reply;
+    HANDLE thread=NULL;bool received=false,completed=false;std::string reply;
     bool active()const{return thread!=NULL;}
     bool start(const std::string& message,int temperature){
         if(active())return false;
         request=message;modelTemp=temperature;InterlockedExchange(&cancelWork,0);
-        setResponse("");reply.clear();received=false;
+        setResponse("");reply.clear();received=false;completed=false;
         thread=CreateThread(NULL,0,generate,NULL,0,NULL);
         return thread!=NULL;
     }
@@ -64,7 +64,7 @@ struct Child {
         if(!thread)return;
         reply=getResponse();received=!reply.empty();
         if(WaitForSingleObject(thread,0)==WAIT_OBJECT_0){
-            reply=getResponse();received=!reply.empty();CloseHandle(thread);thread=NULL;
+            reply=getResponse();received=!reply.empty();DWORD code=99;GetExitCodeThread(thread,&code);completed=code==0&&!cancelled()&&received;CloseHandle(thread);thread=NULL;
         }
     }
     void stop(){if(thread)InterlockedExchange(&cancelWork,1);}
@@ -140,7 +140,7 @@ static int nextSound(int n){return !n;}
 #endif
 static const char* soundName(int n){
 #ifdef RELAY_FLITE
-    if(n==2)return "Voice";
+    if(n==2)return "Auto Voice";
 #endif
     return n?"Tone On":"Sound Off";
 }
@@ -166,7 +166,12 @@ static void quietTone(Mood mood){
 ''')
 between("struct Preferences", "struct Face", r'''
 struct Preferences {
-    int style=0,palette=1,effect=0,sleep=45,tracking=1,autoHinge=0,temp=65,sound=0,clean=1,battery=0;
+    int style=0,palette=1,effect=0,sleep=45,tracking=1,autoHinge=0,temp=65,clean=1,battery=0;
+#ifdef RELAY_FLITE
+    int sound=2;
+#else
+    int sound=0;
+#endif
     void load(){
         HANDLE h=CreateFileW(appPath(L"relay.conf").c_str(),GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
         if(h==INVALID_HANDLE_VALUE)return;
@@ -322,12 +327,19 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
         Child bot;std::string input;
         bool running=true,companion=false,typing=false,shift=false,symbols=false,forcedSleep=false,settings=false,behavior=false;
         bool stroking=false,tonePlayed=false;
+#ifdef RELAY_FLITE
+        std::string pendingSpeech;
+#endif
         int gesture=0,tapCount=0;int64_t pressAt=-1,lastPoke=-10000;int pressX=0,pressY=0;
         int64_t last=ms(),touched=-10000,next=0,moodUntil=0;
         Mood mood=Neutral,promptMood=Neutral;
         auto send=[&](){
             if(!bot.active()&&input.find_first_not_of(" \t\r\n")!=std::string::npos){
-                if(bot.start(input,f.prefs.temp)){closeAudio();promptMood=mood=userMood(input);moodUntil=0;input.clear();typing=shift=symbols=forcedSleep=false;gesture=0;touched=-10000;tonePlayed=false;}
+                if(bot.start(input,f.prefs.temp)){closeAudio();
+#ifdef RELAY_FLITE
+                    pendingSpeech.clear();speechStatus=f.prefs.sound==2?"Awaiting reply":"Auto voice off";
+#endif
+                    promptMood=mood=userMood(input);moodUntil=0;input.clear();typing=shift=symbols=forcedSleep=false;gesture=0;touched=-10000;tonePlayed=false;}
                 else bot.reply="Could not start model.";
                 last=ms();next=0;
             }
@@ -352,15 +364,23 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
                         else if(action=="palette"){f.prefs.palette=(f.prefs.palette+1)%6;f.applyPalette();}
                         else if(action=="effect")f.prefs.effect=(f.prefs.effect+1)%4;
                         else if(action=="tracking")f.prefs.tracking=!f.prefs.tracking;
-                        else if(action=="sound"){closeAudio();f.prefs.sound=nextSound(f.prefs.sound);}
+                        else if(action=="sound"){closeAudio();f.prefs.sound=nextSound(f.prefs.sound);
 #ifdef RELAY_FLITE
-                        else if(action=="voicetest"){changed=false;if(!bot.active()){closeAudio();startSpeech("Hello. I am Relay.");}else speechStatus="Wait for reply";}
+                            pendingSpeech.clear();speechStatus=f.prefs.sound==2?"Auto voice on":"Auto voice off";
+#endif
+                        }
+#ifdef RELAY_FLITE
+                        else if(action=="voicetest"){if(!bot.active()&&!speechThread){closeAudio();pendingSpeech.clear();f.prefs.sound=2;startSpeech("Hello. I am Relay.");}else{changed=false;speechStatus="Wait for audio";}}
 #endif
                         else if(action=="clean"){f.prefs.clean=!f.prefs.clean;f.applyFullscreen();}
                         else if(action=="battery")f.prefs.battery=!f.prefs.battery;
                         else if(action=="sleeptime"){int& t=f.prefs.sleep;t=t==0?15:t==15?45:t==45?120:0;}
                         else if(action=="temperature"){int& t=f.prefs.temp;t=t<40?40:t<65?65:t<85?85:t<100?100:20;}
-                        else if(action=="defaults"){f.prefs=Preferences{};f.applyPalette();f.applyFullscreen();closeAudio();}
+                        else if(action=="defaults"){f.prefs=Preferences{};f.applyPalette();f.applyFullscreen();closeAudio();
+#ifdef RELAY_FLITE
+                            pendingSpeech.clear();
+#endif
+                        }
                         else if(action=="save"){}
                         else if(action=="behavior"){behavior=true;changed=false;}
                         else if(action=="appearance"){behavior=false;changed=false;}
@@ -373,7 +393,11 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
                     else if(action=="symbols")symbols=!symbols;
                     else if(action=="delete"){if(!input.empty())input.pop_back();}
                     else if(action=="send")send();
-                    else if(action=="stop"){bot.stop();mood=promptMood=Neutral;moodUntil=0;closeAudio();}
+                    else if(action=="stop"){bot.stop();mood=promptMood=Neutral;moodUntil=0;closeAudio();
+#ifdef RELAY_FLITE
+                        pendingSpeech.clear();
+#endif
+                    }
                     else if(action=="sleep")forcedSleep=!forcedSleep;
                     else if(action=="mode"){companion=!companion;typing=false;forcedSleep=false;}
                     else if(action=="exit"){running=false;break;}
@@ -416,7 +440,12 @@ int WINAPI WinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
             if(f.prefs.sound==1&&!tonePlayed&&bot.received){tonePlayed=true;quietTone(mood);}
 #ifdef RELAY_FLITE
             updateSpeech();
-            if(f.prefs.sound==2&&wasActive&&!bot.active()&&!tonePlayed&&!cancelled()&&bot.received){tonePlayed=true;startSpeech(bot.reply);}
+            if(f.prefs.sound==2&&bot.completed&&!bot.active()){
+                bot.completed=false;pendingSpeech=bot.reply;speechStatus="Reply queued";
+            }else if(f.prefs.sound!=2){bot.completed=false;pendingSpeech.clear();}
+            if(f.prefs.sound==2&&!bot.active()&&!speechThread&&!wave&&!pendingSpeech.empty()){
+                std::string say; say.swap(pendingSpeech);startSpeech(say);tonePlayed=true;
+            }
 #endif
             if(!bot.active()&&moodUntil&&now>=moodUntil){mood=Neutral;moodUntil=0;}
             if(pressAt>=0&&now-pressAt>=650){gesture=2;touched=last=now;}
@@ -441,7 +470,11 @@ sub('row("Eye tracking",prefs.tracking?"On":"Off","tracking");',r'''#ifdef RELAY
 # Animate the existing mouth waveform during native speech playback too.
 sub('talking=bot.active()&&bot.received;','talking=(bot.active()&&bot.received)||wave!=NULL;')
 # Optional palette-matched battery text, in both modes. Unknown values stay unknown.
-sub('std::string state=thinking?"THINKING":talking?"TALKING":sleepy?"SLEEPY":hingeAvailable?"ONLINE":"MANUAL";','std::string state=thinking?"THINKING":talking?"TALKING":sleepy?"SLEEPY":"CE";if(prefs.battery)state=batteryText();')
+sub('std::string state=thinking?"THINKING":talking?"TALKING":sleepy?"SLEEPY":hingeAvailable?"ONLINE":"MANUAL";',r'''std::string state=thinking?"THINKING":talking?"TALKING":sleepy?"SLEEPY":"CE";
+#ifdef RELAY_FLITE
+            if(prefs.sound==2&&!thinking)state=speechThread?"SYNTH":wave?"SPEAK":"VOICE";
+#endif
+            if(prefs.battery)state=batteryText();''')
 sub('        if(companion){\n            if(rows){','        if(companion){\n            if(prefs.battery){std::string b=batteryText();text(std::max(10,w-int(b.size())*fontW-8),fontAscent+2,b,muted);}\n            if(rows){')
 # Extend casual spelling without changing any LLM response.
 s=s.replace('"you look stupid","you are stupid"','"you look stupid","u look stupid","you are stupid"').replace('"you look cute","you\\x27re cute"','"you look cute","u look cute","you\\x27re cute"')
