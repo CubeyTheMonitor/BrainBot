@@ -51,7 +51,7 @@ jobs:
           cd flite
           # Flite's historic CE configure path expects this toolchain prefix.
           sed -i 's|/opt/mingw32ce/bin/arm-wince-mingw32ce-|arm-mingw32ce-|g; s|/opt/mingw32ce/bin/arm-mingw32ce-|arm-mingw32ce-|g' configure
-          CFLAGS="-O2 -march=armv5tej -mcpu=arm926ej-s -DUNICODE -D_UNICODE" ./configure --target=arm-wince --with-audio=none --with-mmap=none
+          CC=arm-mingw32ce-gcc CFLAGS="-O2 -march=armv5tej -mcpu=arm926ej-s -DUNICODE -D_UNICODE" ./configure --build=x86_64-pc-linux-gnu --host=arm-wince --target=arm-wince --with-audio=none --with-mmap=none || { cat config.log; exit 1; }
           make -C src
           make -C lang/usenglish
           make -C lang/cmulex
